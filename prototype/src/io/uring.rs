@@ -150,7 +150,10 @@ pub enum OpCompletionAction {
 
 #[derive(Debug, Clone, Copy)]
 pub enum UringPollMode {
-    AutoPoll { idle_time: Duration, cpu_affinity: Option<u32> },
+    AutoPoll {
+        idle_time: Duration,
+        cpu_affinity: Option<u32>,
+    },
     ManualPoll,
 }
 
@@ -281,7 +284,7 @@ struct IOStats {
     doorbell_rings: usize,
     enter_timeouts: usize,
     total_syscall_us: f64,
-    last_known_cq_batch_size: usize
+    last_known_cq_batch_size: usize,
 }
 
 struct DoorbellState {
@@ -309,7 +312,11 @@ impl DoorbellState {
         } else {
             let ptr = self.eventfd_buffer.as_mut_ptr();
             self.eventfd_armed = true;
-            Some(opcode::Read::new(types::Fd(self.fd.as_raw_fd()), ptr, 8).build().user_data(ud))
+            Some(
+                opcode::Read::new(types::Fd(self.fd.as_raw_fd()), ptr, 8)
+                    .build()
+                    .user_data(ud),
+            )
         }
     }
 }
@@ -334,7 +341,7 @@ pub struct UringContext {
     /// Allow waking once objects have been submitted
     submission_wakers: WakerList,
     /// idempotency for completion handling
-    am_in_completion: Cell<bool>
+    am_in_completion: Cell<bool>,
 }
 
 impl Drop for UringContext {
@@ -372,7 +379,10 @@ impl UringContext {
         // set poll mode
         match cfg.poll_mode {
             UringPollMode::ManualPoll => {}
-            UringPollMode::AutoPoll { idle_time, cpu_affinity } => {
+            UringPollMode::AutoPoll {
+                idle_time,
+                cpu_affinity,
+            } => {
                 builder.setup_sqpoll(idle_time.as_millis() as u32);
                 if let Some(cpu) = cpu_affinity {
                     builder.setup_sqpoll_cpu(cpu);
@@ -401,7 +411,7 @@ impl UringContext {
             stats: IOStats::default(),
             doorbell: DoorbellState::new()?,
             submission_wakers: WakerList::new(),
-            am_in_completion: Cell::new(false)
+            am_in_completion: Cell::new(false),
         };
         res.stats.global_start_time.start_measurement();
         Ok(res)
@@ -508,11 +518,16 @@ impl UringContext {
                     UringPollMode::ManualPoll => {
                         let batch_based = self.ring.submission().len() >= self.submit_threshold;
                         // XXX do this? don't enter if there were completions even if other conditions fulfilled?
-                        let time_based = self.stats.last_submit.stop_measurement() >= Self::MAX_SUBMIT_MICROS;
+                        let time_based =
+                            self.stats.last_submit.stop_measurement() >= Self::MAX_SUBMIT_MICROS;
                         batch_based || time_based
                     }
                 };
-                if enter { self.submit_inner(intent, 0) } else { Ok(0) }
+                if enter {
+                    self.submit_inner(intent, 0)
+                } else {
+                    Ok(0)
+                }
             }
             IOEnterIntent::Starved => {
                 self.stats.intents_starved += 1;
@@ -536,9 +551,18 @@ impl UringContext {
     fn request_unpark(&self) {
         // XXX async on other thread? how fast is eventfd write?
         let mut buf = [1u8; 8];
-        let res = unsafe { libc::write(self.doorbell.fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, 8) };
+        let res = unsafe {
+            libc::write(
+                self.doorbell.fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                8,
+            )
+        };
         if res < 0 {
-            panic!("eventfd write error error while unparking thread: {:?}", std::io::Error::last_os_error());
+            panic!(
+                "eventfd write error error while unparking thread: {:?}",
+                std::io::Error::last_os_error()
+            );
         }
     }
 
@@ -577,7 +601,7 @@ impl UringContext {
         // idempotency
         if self.am_in_completion.replace(true) {
             log::warn!("entering CQ while harvesting!");
-            return Ok(0)
+            return Ok(0);
         }
         // Process all available completions without blocking
         let mut cq = self.ring.completion();
@@ -619,11 +643,18 @@ impl UringContext {
                             if let Some(waker) = pending_op.waker.take() {
                                 waker.wake();
                             } else {
-                                log::error!("Task {:?} is done ({}) without having a waker registered yet", op_id, result);
+                                log::error!(
+                                    "Task {:?} is done ({}) without having a waker registered yet",
+                                    op_id,
+                                    result
+                                );
                             }
                         }
                         OpCompletionAction::Drop => {
-                            let _ = std::mem::replace(pending_op, PendingOp::empty(self.stats.submission_epoch));
+                            let _ = std::mem::replace(
+                                pending_op,
+                                PendingOp::empty(self.stats.submission_epoch),
+                            );
                             self.free_slots.push(op_id.slot());
                         }
                     }
@@ -645,7 +676,11 @@ impl UringContext {
             } else {
                 // Slot index out of bounds - shouldn't happen but log it in debug
                 #[cfg(debug_assertions)]
-                log::error!("Completion for invalid slot index: slot={}, op_id={}", op_id.slot(), op_id.uid());
+                log::error!(
+                    "Completion for invalid slot index: slot={}, op_id={}",
+                    op_id.slot(),
+                    op_id.uid()
+                );
             }
         }
         let _x = self.am_in_completion.replace(false);
@@ -692,7 +727,10 @@ impl UringContext {
 
     /// Allocate a slot for a new operation and return OpId
     #[inline]
-    pub(super) fn register_buffer_op(&mut self, buffer: IoBuf) -> Result<(OpId, &mut IoBuf), IoBuf> {
+    pub(super) fn register_buffer_op(
+        &mut self,
+        buffer: IoBuf,
+    ) -> Result<(OpId, &mut IoBuf), IoBuf> {
         match self.register_new_pending_op() {
             Some((id, opref)) => {
                 opref.buffer = Some(buffer);
@@ -725,7 +763,10 @@ impl UringContext {
                     log::error!("instructed to wake pending op in access action");
                 }
                 OpCompletionAction::Drop => {
-                    let _old = std::mem::replace(pending_op, PendingOp::empty(self.stats.submission_epoch));
+                    let _old = std::mem::replace(
+                        pending_op,
+                        PendingOp::empty(self.stats.submission_epoch),
+                    );
                     self.free_slots.push(slot_idx);
                 }
             };
@@ -763,14 +804,24 @@ impl UringContext {
     }
 
     #[inline]
-    pub(super) fn take_result(&mut self, op_id: OpId, waker: &Waker) -> Poll<((io::Result<i32>, Option<IoBuf>), u64)> {
+    pub(super) fn take_result(
+        &mut self,
+        op_id: OpId,
+        waker: &Waker,
+    ) -> Poll<((io::Result<i32>, Option<IoBuf>), u64)> {
         let slot_idx = op_id.slot() as usize;
 
         if let Some(pending_op) = self.slots.get_mut(slot_idx) {
             // Verify op_id matches (operation wasn't cancelled/replaced)
             if pending_op.uid != op_id.uid() {
                 return Poll::Ready((
-                    (Err(io::Error::new(io::ErrorKind::Other, "Operation was cancelled or replaced")), None),
+                    (
+                        Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "Operation was cancelled or replaced",
+                        )),
+                        None,
+                    ),
                     0,
                 ));
             }
@@ -778,7 +829,8 @@ impl UringContext {
             // Check if result is ready
             if let Some(result) = pending_op.result {
                 // Free the slot by setting op_id to 0 and returning to free_slots stack
-                let old = std::mem::replace(pending_op, PendingOp::empty(self.stats.submission_epoch));
+                let old =
+                    std::mem::replace(pending_op, PendingOp::empty(self.stats.submission_epoch));
                 self.free_slots.push(op_id.slot());
 
                 #[cfg(feature = "trace-requests")] // measured by completion queue loop
@@ -790,7 +842,10 @@ impl UringContext {
                 let cycles = 0;
 
                 if result < 0 && result != -libc::ETIME {
-                    Poll::Ready(((Err(io::Error::from_raw_os_error(-result)), old.buffer), cycles))
+                    Poll::Ready((
+                        (Err(io::Error::from_raw_os_error(-result)), old.buffer),
+                        cycles,
+                    ))
                 } else {
                     Poll::Ready(((Ok(result), old.buffer), cycles))
                 }
@@ -800,7 +855,13 @@ impl UringContext {
                 Poll::Pending
             }
         } else {
-            Poll::Ready(((Err(io::Error::new(io::ErrorKind::Other, "Invalid slot index")), None), 0))
+            Poll::Ready((
+                (
+                    Err(io::Error::new(io::ErrorKind::Other, "Invalid slot index")),
+                    None,
+                ),
+                0,
+            ))
         }
     }
 
@@ -811,8 +872,12 @@ impl UringContext {
         waker: &Waker,
     ) -> Poll<((io::Result<usize>, IoBuf), u64)> {
         match self.take_result(op_id, waker) {
-            Poll::Ready(((Ok(n), buf), cycles)) => Poll::Ready(((Ok(n as usize), unsafe { buf.unwrap_unchecked() }), cycles)),
-            Poll::Ready(((Err(e), buf), cycles)) => Poll::Ready(((Err(e), unsafe { buf.unwrap_unchecked() }), cycles)),
+            Poll::Ready(((Ok(n), buf), cycles)) => {
+                Poll::Ready(((Ok(n as usize), unsafe { buf.unwrap_unchecked() }), cycles))
+            }
+            Poll::Ready(((Err(e), buf), cycles)) => {
+                Poll::Ready(((Err(e), unsafe { buf.unwrap_unchecked() }), cycles))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -850,7 +915,6 @@ impl ThreadUring {
     pub fn last_known_cq_batch_size(&self) -> usize {
         self.access(|uring| uring.stats.last_known_cq_batch_size) as usize
     }
-
 
     pub fn enter(&self, intent: IOEnterIntent) {
         let _ = self.access(|uring| uring.enter(intent));
@@ -948,7 +1012,8 @@ pub trait CompletionBasedFuture: Sized {
     fn op_id(&self) -> OpId;
     fn context(&self) -> &ThreadUring;
     fn deregister_op(&self) {
-        self.context().access(|ctx| ctx.drop_registered_op(self.op_id()));
+        self.context()
+            .access(|ctx| ctx.drop_registered_op(self.op_id()));
     }
 
     fn fire_and_forget(self) -> FireAndForget<Self> {
@@ -970,7 +1035,9 @@ impl<Fut: CompletionBasedFuture> FireAndForget<Fut> {
         // SAFETY: inner holds Rc to uring, so the context wakelist ptr must also be valid
         // during that time
         let raw_list: &'static WakerList = unsafe {
-            let ptr = inner.context().access(|uring| &uring.submission_wakers as *const WakerList);
+            let ptr = inner
+                .context()
+                .access(|uring| &uring.submission_wakers as *const WakerList);
             &*ptr
         };
         let wake_list = WakerGuard::new(raw_list);
@@ -990,7 +1057,8 @@ impl<Fut: CompletionBasedFuture> Future for FireAndForget<Fut> {
                 OpStage::Unsubmitted => {
                     // wait until submission to ensure  resources are kept around
                     this.wake_list.register(cx.waker());
-                    unsafe { ctx.slots.get_unchecked_mut(op_id.slot as usize) }.set_waker(cx.waker().clone());
+                    unsafe { ctx.slots.get_unchecked_mut(op_id.slot as usize) }
+                        .set_waker(cx.waker().clone());
                     Poll::Pending
                 }
                 OpStage::Submitted => {
@@ -1126,11 +1194,15 @@ impl ThreadUring {
     ) -> PendingBufferOp {
         self.access(|context| {
             // Allocate a slot and get op_id
-            let (op_id, buf) = context.register_buffer_op(buf).expect("No free slots available");
+            let (op_id, buf) = context
+                .register_buffer_op(buf)
+                .expect("No free slots available");
             // Prepare operation
             let op = init(op_id, buf).user_data(op_id.into_user_data());
             // enqueue to uring
-            context.enqueue_retry_once(op).expect("couldn't enqueue uring op after 2 tries");
+            context
+                .enqueue_retry_once(op)
+                .expect("couldn't enqueue uring op after 2 tries");
             // let _ = context.submit_non_blocking(false);
             PendingBufferOp {
                 trace_type,
@@ -1152,7 +1224,9 @@ impl ThreadUring {
             // Prepare operation
             let op = init(op_id).user_data(op_id.into_user_data());
             // enqueue to uring
-            context.enqueue_retry_once(op).expect("couldn't enqueue uring op after 2 tries");
+            context
+                .enqueue_retry_once(op)
+                .expect("couldn't enqueue uring op after 2 tries");
             // let _ = context.submit_non_blocking(false);
             PendingSimpleOp {
                 trace_type,
@@ -1175,15 +1249,25 @@ pub enum FileSizeType {
 impl ThreadUring {
     pub fn fdatasync(&self, fd: impl AsRawFd) -> PendingSimpleOp {
         self.generic_simple_op(RequestTracingType::Fsync, |_| {
-            opcode::Fsync::new(types::Fd(fd.as_raw_fd())).flags(FsyncFlags::DATASYNC).build()
+            opcode::Fsync::new(types::Fd(fd.as_raw_fd()))
+                .flags(FsyncFlags::DATASYNC)
+                .build()
         })
     }
 
-    pub async fn open<A: AsRef<Path>>(&self, path: A, flags: i32, mode: Option<u32>) -> std::io::Result<RawFd> {
+    pub async fn open<A: AsRef<Path>>(
+        &self,
+        path: A,
+        flags: i32,
+        mode: Option<u32>,
+    ) -> std::io::Result<RawFd> {
         let path_str_c = CString::new(path.as_ref().as_os_str().as_bytes()).unwrap();
         let fd = self
             .generic_simple_op(RequestTracingType::Open, |_| {
-                opcode::OpenAt::new(types::Fd(-1), path_str_c.as_ptr()).flags(flags).mode(mode.unwrap_or(0)).build()
+                opcode::OpenAt::new(types::Fd(-1), path_str_c.as_ptr())
+                    .flags(flags)
+                    .mode(mode.unwrap_or(0))
+                    .build()
             })
             .await?;
         Ok(fd)
@@ -1191,25 +1275,34 @@ impl ThreadUring {
 
     pub fn fallocate(&self, fd: impl AsRawFd, mode: i32, offset: u64, len: u64) -> PendingSimpleOp {
         self.generic_simple_op(RequestTracingType::Fallocate, |_| {
-            opcode::Fallocate::new(types::Fd(fd.as_raw_fd()), len).mode(mode).offset(offset).build()
+            opcode::Fallocate::new(types::Fd(fd.as_raw_fd()), len)
+                .mode(mode)
+                .offset(offset)
+                .build()
         })
     }
 
     pub fn close(&self, fd: impl AsRawFd) -> PendingSimpleOp {
-        self.generic_simple_op(RequestTracingType::Close, |_| opcode::Close::new(types::Fd(fd.as_raw_fd())).build())
+        self.generic_simple_op(RequestTracingType::Close, |_| {
+            opcode::Close::new(types::Fd(fd.as_raw_fd())).build()
+        })
     }
 
     pub fn write(&self, fd: impl AsRawFd, offset: u64, buf: IoBuf) -> PendingBufferOp {
         let fd = fd.as_raw_fd();
         self.generic_buffer_op(RequestTracingType::Write, buf, |_op_id, buf| {
-            opcode::Write::new(types::Fd(fd), buf.ptr(), buf.used_bytes() as u32).offset(offset).build()
+            opcode::Write::new(types::Fd(fd), buf.ptr(), buf.used_bytes() as u32)
+                .offset(offset)
+                .build()
         })
     }
 
     pub fn read(&self, fd: impl AsRawFd, offset: u64, buf: IoBuf) -> PendingBufferOp {
         let fd = fd.as_raw_fd();
         self.generic_buffer_op(RequestTracingType::Read, buf, |_op_id, buf| {
-            opcode::Read::new(types::Fd(fd), buf.ptr_mut(), buf.used_bytes() as u32).offset(offset).build()
+            opcode::Read::new(types::Fd(fd), buf.ptr_mut(), buf.used_bytes() as u32)
+                .offset(offset)
+                .build()
         })
     }
 
@@ -1247,7 +1340,9 @@ impl ThreadUring {
         println!("ioctl_data is {:?}", ioctl_data);
         let result = self
             .generic_simple_op(RequestTracingType::IoCtl, |_op_id| {
-                opcode::UringCmd16::new(types::Fd(fd), BLKGETSIZE64).cmd(ioctl_data).build()
+                opcode::UringCmd16::new(types::Fd(fd), BLKGETSIZE64)
+                    .cmd(ioctl_data)
+                    .build()
             })
             .await;
 
@@ -1257,7 +1352,11 @@ impl ThreadUring {
                 Ok(*output.get_mut())
             }
             Err(e) => {
-                log::error!("error during BLKGETSIZE64 ioctl: {} (errno: {:?})", e, e.raw_os_error());
+                log::error!(
+                    "error during BLKGETSIZE64 ioctl: {} (errno: {:?})",
+                    e,
+                    e.raw_os_error()
+                );
                 Err(e)
             }
         }
@@ -1328,7 +1427,12 @@ impl ThreadUring {
         }
     }
 
-    pub fn send(&self, sock: impl AsRawFd, to: (*const libc::sockaddr, usize), buf: IoBuf) -> PendingBufferOp {
+    pub fn send(
+        &self,
+        sock: impl AsRawFd,
+        to: (*const libc::sockaddr, usize),
+        buf: IoBuf,
+    ) -> PendingBufferOp {
         let fd = sock.as_raw_fd();
         self.generic_buffer_op(RequestTracingType::Send, buf, |_op_id, buf| {
             opcode::Send::new(types::Fd(fd), buf.ptr(), buf.used_bytes() as u32)
@@ -1338,7 +1442,12 @@ impl ThreadUring {
         })
     }
 
-    pub async fn send_to(&self, sock: impl AsRawFd, addr: SocketAddr, buf: IoBuf) -> (io::Result<usize>, IoBuf) {
+    pub async fn send_to(
+        &self,
+        sock: impl AsRawFd,
+        addr: SocketAddr,
+        buf: IoBuf,
+    ) -> (io::Result<usize>, IoBuf) {
         let port = addr.port();
         match addr {
             SocketAddr::V4(v4) => {
@@ -1350,7 +1459,10 @@ impl ThreadUring {
                     },
                     sin_zero: [0u8; 8],
                 };
-                let to_raw = (&to as *const libc::sockaddr_in as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in>());
+                let to_raw = (
+                    &to as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>(),
+                );
                 self.send(sock, to_raw, buf).await
             }
             SocketAddr::V6(v6) => {
@@ -1364,8 +1476,10 @@ impl ThreadUring {
                     },
                     sin6_scope_id: 0,
                 };
-                let to_raw =
-                    (&to as *const libc::sockaddr_in6 as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>());
+                let to_raw = (
+                    &to as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>(),
+                );
                 self.send(sock, to_raw, buf).await
             }
         }
@@ -1383,7 +1497,10 @@ impl ThreadUring {
                     },
                     sin_zero: [0u8; 8],
                 };
-                let to_raw = (&to as *const libc::sockaddr_in as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in>());
+                let to_raw = (
+                    &to as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>(),
+                );
                 self.send(sock, to_raw, buf).fire_and_forget().await;
             }
             SocketAddr::V6(v6) => {
@@ -1397,8 +1514,10 @@ impl ThreadUring {
                     },
                     sin6_scope_id: 0,
                 };
-                let to_raw =
-                    (&to as *const libc::sockaddr_in6 as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>());
+                let to_raw = (
+                    &to as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>(),
+                );
                 self.send(sock, to_raw, buf).fire_and_forget().await;
             }
         }
@@ -1426,6 +1545,16 @@ impl ThreadUring {
             .await?;
         debug_assert!(result == 0 || result == -libc::ETIME); // etime_success
         Ok(())
+    }
+
+    pub fn tcp_listener(&self, addr: impl Into<SocketAddr>) -> io::Result<std::net::TcpListener> {
+        let addr = addr.into();
+        let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        socket.set_reuse_port(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(1024)?;
+        Ok(socket.into())
     }
 }
 
@@ -1479,7 +1608,9 @@ mod tests {
         c_start.start_measurement();
         let mut timeout = std::pin::pin!(uring.sleep(t));
         while let Poll::Pending = timeout.as_mut().poll(&mut ctx) {
-            uring.access(|c| c.enter(IOEnterIntent::Submit)).expect("error during uring submit");
+            uring
+                .access(|c| c.enter(IOEnterIntent::Submit))
+                .expect("error during uring submit");
         }
         let micros = c_start.stop_measurement();
         let elapsed = t_start.elapsed();
@@ -1529,7 +1660,10 @@ mod tests {
         };
         println!("Regular statx call result: {}", statx_result);
         if statx_result == 0 {
-            println!("Regular statx succeeded, file size: {}", regular_statx.stx_size);
+            println!(
+                "Regular statx succeeded, file size: {}",
+                regular_statx.stx_size
+            );
         }
 
         let res = context.file_statx(fd).await;
@@ -1564,7 +1698,10 @@ mod tests {
         .expect("Failed to create io_uring");
         test_exec().spawn(context.new_spurious_poller());
         let test_file = "/dev/sda";
-        let file = std::fs::OpenOptions::new().read(true).open(&test_file).expect("Failed to open test file");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&test_file)
+            .expect("Failed to open test file");
         let fd = file.as_raw_fd();
 
         let blksize = context.get_file_size(fd).await;
