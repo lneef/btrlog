@@ -3,7 +3,7 @@ use io_uring::{IoUring, opcode, squeue, types};
 #[cfg(feature = "trace-requests")]
 use reqtrace::CycleMeasurement;
 use reqtrace::FrequencyScale;
-use socket2::{Domain, SockAddr, Socket, Type};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::cell::{Cell, UnsafeCell};
 use std::ffi::CString;
 use std::future::Future;

@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use io_uring::types::BufRingEntry;
 use io_uring::{Submitter, cqueue, opcode, squeue, types};
 
-/// Per-buffer size: 2048 bytes payload plus 64 bytes header slack.
 pub const BUF_SIZE: usize = 2048 + 64;
 
 const ENTRY_SIZE: usize = std::mem::size_of::<BufRingEntry>();

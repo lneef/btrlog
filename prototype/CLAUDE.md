@@ -49,6 +49,10 @@ For send we want to use `iovec` to forward multiple messages over a single strea
     - Client and Server have some code duplication, logic might be replicated to both peers
     - Use dyn traits on the less hot paths instead of `match` expressions
 
+### Anti-Patterns
+- Implementing your own wrappers/handles when appropraite structures are already provided by the imported crates especially in io-uring
+- aggressive usage of helpers structs for debug asserts (to track ownership etc)
+
 ## Simplicity is Key
 - Keep changes minimal, always ask yourself before implementing anything: Is there a simpler alternative. Artifical Complexity is error-prone, simplicity is key to keep the code traceable.
 - Do not create multiple layer of abstractions where one suffices
@@ -67,10 +71,8 @@ cargo build
 cargo build --release
 ```
 
+## System Test
+To test the system end-to-end use the local cluster over loopback.
 ```bash
-sudo ./v2_bench --journal-threads 4 --primary-thread-count 4 --initial-log-count 8 \
-    --op-count $((500*1000)) --track-percentiles \
-    --min-message-size 128 --max-message-size 128 --zipf-factor 0.0001 \
-    --wal-flush-interval-us 0 --log-creation-interval-ms 500 --print-interval-ms 1000 \
-    --max-log-push-interval-ms 2 --thread-placement unpinned --io-mode manual-poll --wal mock
+./control/scripts/local_cluster.sh
 ```
