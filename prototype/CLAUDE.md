@@ -3,7 +3,16 @@
 ## Scope
 
 The goal is implement a TCP networking layer for BTRLOG. Currently only UDP is implemented. On the send side TCP buffers into iovec for sending to comply with urings one 
-outstanding send per stream limit. On the receive side the main eventloop dispatched incoming packets via multishot recv.
+outstanding send per stream limit.
+
+### Receive
+On the receive side the main eventloop dispatched incoming packets via multishot recv.
+- Dispatcher decodes incoming packets into iobuf. Used multishot buffers are resubmitted
+- With the new buffer new tasks are spawned
+
+### Send
+For send we want to use `iovec` to forward multiple messages over a single stream. To this end we have a staging queue per connection to stage iovec entries which are then forwarded to uring using `send_msg`. The tasks <-> request mapping is kept as a table to iovec indices. Before resubmitting the table is normalized to keep the stream order.
+
 ## Structure 
 | Path | Description |
 |------|-------------|
