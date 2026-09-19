@@ -203,6 +203,7 @@ where
                         let header = PacketHeader {
                             msg_id: pkt.header.msg_id,
                             reply_to: self.port,
+                            fragment_len: 0,
                         };
                         log::info!("replying to shutdown request {:?} with {:?}", pkt.header, header);
                         self.net_send(header, res.clone().into(), fwd).await;
@@ -220,6 +221,7 @@ where
             let header = PacketHeader {
                 msg_id: pkt.header.msg_id,
                 reply_to: self.port,
+                fragment_len: 0,
             };
             log::trace!(
                 "Processing packet {} with logid {} myself ({}) at {}us",
@@ -277,7 +279,7 @@ where
         let mut outgoing = crate::io::local_packet_buffer_pool().pop();
         let _msgid = header.msg_id;
         let pkt = ResponsePacket { header, request };
-        let bytes = match pkt.encode_into(outgoing.as_mut_slice()) {
+        let bytes = match pkt.encode_framed(outgoing.as_mut_slice()) {
             Ok(bytes) => bytes,
             Err(encode_err) => {
                 log::error!("Got encoding error {:?}", encode_err);
@@ -311,6 +313,7 @@ where
                 header: PacketHeader {
                     msg_id: u64::MAX,
                     reply_to: 0,
+                    fragment_len: 0,
                 },
                 request: JournalRequest::Shutdown,
             };
@@ -368,6 +371,7 @@ where
                 return;
             }
         };
+        debug_assert_eq!(_msgbytes, PacketHeader::WIRE_SIZE + pkt.header.fragment_len as usize);
         log::debug!("spawning request for packet {:?} from op id {:?} at {:?}", pkt.header, _opid, Instant::now());
         self.spawn_request_op(from, pkt);
     }

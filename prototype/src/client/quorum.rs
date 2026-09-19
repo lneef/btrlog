@@ -126,6 +126,7 @@ impl PacketConsumer for Rc<GlobalQuorumState> {
                 return;
             }
         };
+        debug_assert_eq!(_bytes, PacketHeader::WIRE_SIZE + pkg.header.fragment_len as usize);
         let (slot, uid) = ((pkg.header.msg_id >> 32) as u16, pkg.header.msg_id as u32);
         // XXX this doesn't need to be the case, but the current
         // implementation has this property; assert to ensure correct logic
@@ -248,10 +249,11 @@ impl JournalQuorumDriver {
             header: PacketHeader {
                 msg_id: ((slot as u64) << 32) | (uid as u64),
                 reply_to: local_port,
+                fragment_len: 0,
             },
             request: req,
         };
-        let mut bufs = Self::encode_many(&self.bufpool, spec.cluster_size, packet)
+        let mut bufs = Self::encode_many(&self.bufpool, spec.cluster_size, |dst| packet.encode_framed(dst))
             .map_err(|_| RetryRequestError::MessageEncoding)?
             .collect::<ForCluster<_>>();
         // track time 
@@ -393,13 +395,13 @@ impl JournalQuorumDriver {
         Err(RetryRequestError::TooManyRetries(spec.maj_timeout, spec.retries, t_start.elapsed()))
     }
 
-    pub(crate) fn encode_many<R: WireMessage<()>>(
+    pub(crate) fn encode_many(
         bufpool: &ThreadBuffers,
         n: usize,
-        req: R,
+        encode: impl FnOnce(&mut [u8]) -> Result<usize, EncodeError>,
     ) -> Result<impl Iterator<Item = IoBuffer>, EncodeError> {
         let mut first_buf = bufpool.pop();
-        let bytes = req.encode_into(first_buf.data_mut())?;
+        let bytes = encode(first_buf.data_mut())?;
         first_buf.mark_used(bytes);
         let ptr = first_buf.ptr();
         let iter = std::iter::once(first_buf).chain(bufpool.iter().take(n - 1).map(move |mut buf| {
@@ -435,7 +437,7 @@ mod tests {
         let pool = local_packet_buffer_pool();
         let id = JournalId::dst_random();
         let msg = JournalMetadataRequest { id: id.clone().into() };
-        let res: Vec<_> = JournalQuorumDriver::encode_many(&pool, 3, msg.clone()).expect("error encoding message").collect();
+        let res: Vec<_> = JournalQuorumDriver::encode_many(&pool, 3, |dst| msg.clone().encode_into(dst)).expect("error encoding message").collect();
         debug_assert_eq!(res.len(), 3);
         let expected_id = id.into();
         for (idx, buf) in res.iter().enumerate() {
