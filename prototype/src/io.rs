@@ -1,3 +1,4 @@
+pub mod buf_ring;
 pub mod buffer;
 pub mod send_buffer;
 pub mod uring;
