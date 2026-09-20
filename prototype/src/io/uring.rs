@@ -1,5 +1,5 @@
 use io_uring::types::FsyncFlags;
-use io_uring::{IoUring, opcode, squeue, types};
+use io_uring::{IoUring, cqueue, opcode, squeue, types};
 #[cfg(feature = "trace-requests")]
 use reqtrace::CycleMeasurement;
 use reqtrace::FrequencyScale;
@@ -22,6 +22,7 @@ use crate::config::IOConfig;
 use crate::runtime::rcwaker::RcWaker;
 use crate::runtime::waker_chain::{WakerGuard, WakerList};
 
+use super::buf_ring::{BufId, BufRing, RecvBuf};
 use super::buffer::IoBuf;
 
 pub struct PendingOp {
@@ -31,6 +32,7 @@ pub struct PendingOp {
     buffer: Option<IoBuf>,
     waker: Option<Waker>,
     pub result: Option<i32>,
+    multi: Option<Box<Multishot>>,
     #[cfg(feature = "trace-requests")]
     duration_trace: u64,
 }
@@ -50,6 +52,7 @@ impl PendingOp {
             buffer: None,
             waker: None,
             result: None,
+            multi: None,
             #[cfg(feature = "trace-requests")]
             duration_trace: 0,
         }
@@ -175,6 +178,8 @@ pub struct UringConfig {
     pub syscall_timeout_us: usize,
     pub allow_parking: bool,
     pub print_slow_submits: bool,
+    /// provided buffers for multishot recv; power of two
+    pub buf_ring_entries: u16,
 }
 impl UringConfig {
     pub fn with<F: FnOnce(&mut Self)>(mut self, f: F) -> Self {
@@ -208,6 +213,7 @@ impl Default for UringConfig {
             syscall_timeout_us: 100,
             allow_parking: true,
             print_slow_submits: true,
+            buf_ring_entries: 512,
         }
     }
 }
@@ -342,17 +348,25 @@ pub struct UringContext {
     submission_wakers: WakerList,
     /// idempotency for completion handling
     am_in_completion: Cell<bool>,
+    /// provided buffers for multishot recv
+    buf_ring: BufRing,
+    /// multishot ops waiting for submission
+    rearm: Vec<OpId>,
 }
 
 impl Drop for UringContext {
     fn drop(&mut self) {
         self.print_stats();
+        if let Err(e) = self.buf_ring.unregister(&self.ring.submitter()) {
+            log::error!("unregistering buf ring failed: {}", e);
+        }
     }
 }
 
 impl UringContext {
     const MAX_SUBMIT_MICROS: f64 = 5.0;
     const EVENTFD_USER_DATA: u64 = OpId::get_reserved_opid(0);
+    const CANCEL_USER_DATA: u64 = OpId::get_reserved_opid(1);
 
     fn new(mut cfg: UringConfig) -> io::Result<Self> {
         cfg.normalize();
@@ -401,8 +415,13 @@ impl UringContext {
             }
         }
         let submit_threshold = (cfg.sq_entries / 4).min(1) as usize;
+        let ring = builder.build(cfg.sq_entries)?;
+        let mut buf_ring = BufRing::new(0, cfg.buf_ring_entries)?;
+        buf_ring.register(&ring.submitter())?;
+        buf_ring.promote(usize::MAX);
+        buf_ring.flush();
         let mut res = Self {
-            ring: builder.build(cfg.sq_entries)?,
+            ring,
             config: cfg,
             slots,
             free_slots,
@@ -412,6 +431,8 @@ impl UringContext {
             doorbell: DoorbellState::new()?,
             submission_wakers: WakerList::new(),
             am_in_completion: Cell::new(false),
+            buf_ring,
+            rearm: Vec::with_capacity(16),
         };
         res.stats.global_start_time.start_measurement();
         Ok(res)
@@ -506,6 +527,7 @@ impl UringContext {
 
     /// Submit operations without blocking
     pub fn enter(&mut self, intent: IOEnterIntent) -> io::Result<usize> {
+        self.arm_multishot();
         match intent {
             IOEnterIntent::Poll => {
                 self.stats.intents_polling += 1;
@@ -618,14 +640,46 @@ impl UringContext {
                 continue;
             }
             // it's regular I/O; update tracking, cast to I/O slot, callback
-            self.stats.outstanding_ios -= 1;
             let result = cqe.result();
+            let flags = cqe.flags();
+            let more = cqueue::more(flags);
+            if !more {
+                self.stats.outstanding_ios -= 1;
+            }
+            if std::hint::unlikely(user_data == Self::CANCEL_USER_DATA) {
+                continue;
+            }
             let op_id = OpId::from_user_data(user_data);
             debug_assert!(op_id.uid() > 0 && op_id.uid() <= OpId::MAX_OP_UID);
             // Direct access to the slot
             if let Some(pending_op) = self.slots.get_mut(op_id.slot() as usize) {
                 // Check if slot is occupied (op_id != 0) and matches
                 if pending_op.uid == op_id.uid() {
+                    if let Some(state) = pending_op.multi.as_deref_mut() {
+                        state.armed = more;
+                        let cqe = RawCqe { result, flags };
+                        // the consumer may cancel this or submit other ops from within the callback
+                        let live = if state.cancelled {
+                            state.op.discard(&mut self.buf_ring, cqe);
+                            false
+                        } else {
+                            let live = state.op.complete(&mut self.buf_ring, cqe);
+                            debug_assert!(live || !more, "the kernel ends an op with the error");
+                            live
+                        };
+                        // queued: cancelled in the callback, arm_multishot frees the slot
+                        if more || state.queued {
+                            continue;
+                        }
+                        if live && !state.cancelled {
+                            state.queued = true;
+                            self.rearm.push(op_id);
+                        } else {
+                            *pending_op = PendingOp::empty(self.stats.submission_epoch);
+                            self.free_slots.push(op_id.slot());
+                        }
+                        continue;
+                    }
                     // Op ID matches - store the result
                     pending_op.result = Some(result);
                     #[cfg(feature = "trace-requests")]
@@ -685,6 +739,8 @@ impl UringContext {
         }
         let _x = self.am_in_completion.replace(false);
         debug_assert_eq!(_x, true);
+        drop(cq);
+        self.arm_multishot();
         Ok(len)
     }
 
@@ -714,6 +770,7 @@ impl UringContext {
             buffer: None,
             waker: None,
             result: None,
+            multi: None,
             #[cfg(feature = "trace-requests")]
             duration_trace: CycleMeasurement::now(),
         };
@@ -880,6 +937,198 @@ impl UringContext {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//  multishot operations
+
+/// Connections of a multishot accept.
+pub trait AcceptConsumer: 'static {
+    fn on_accept(&mut self, conn: OwnedFd);
+    /// The accept failed. No further callbacks.
+    fn on_end(&mut self, err: io::Error);
+}
+
+/// Bytes of a multishot recv.
+pub trait RecvConsumer: 'static {
+    /// `data` is valid during the call only.
+    fn on_data(&mut self, data: &[u8]);
+    /// The peer closed the stream (`None`) or the recv failed. No further callbacks.
+    fn on_end(&mut self, err: Option<io::Error>);
+}
+
+/// Cancels the op when dropped. The consumer is dropped without `on_end`.
+#[must_use = "dropping the handle cancels the op"]
+pub struct MultishotHandle {
+    context: ThreadUring,
+    op_id: OpId,
+}
+
+impl Drop for MultishotHandle {
+    fn drop(&mut self) {
+        self.context.access(|ctx| ctx.cancel_multishot(self.op_id));
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RawCqe {
+    result: i32,
+    flags: u32,
+}
+
+trait MultishotOp {
+    fn sqe(&self, buf_ring: &BufRing) -> squeue::Entry;
+    /// Dispatches one completion. `false` once the op ended for good.
+    fn complete(&mut self, buf_ring: &mut BufRing, cqe: RawCqe) -> bool;
+    /// Frees the resources of a completion nobody consumes.
+    fn discard(&self, buf_ring: &mut BufRing, cqe: RawCqe);
+}
+
+struct AcceptOp<C> {
+    fd: RawFd,
+    consumer: C,
+}
+
+impl<C: AcceptConsumer> MultishotOp for AcceptOp<C> {
+    fn sqe(&self, _buf_ring: &BufRing) -> squeue::Entry {
+        opcode::AcceptMulti::new(types::Fd(self.fd)).flags(libc::SOCK_CLOEXEC).build()
+    }
+
+    fn complete(&mut self, _buf_ring: &mut BufRing, cqe: RawCqe) -> bool {
+        if cqe.result < 0 {
+            self.consumer.on_end(io::Error::from_raw_os_error(-cqe.result));
+            return false;
+        }
+        // SAFETY: the kernel handed us a fresh descriptor, nothing else owns it
+        self.consumer.on_accept(unsafe { OwnedFd::from_raw_fd(cqe.result) });
+        true
+    }
+
+    fn discard(&self, _buf_ring: &mut BufRing, cqe: RawCqe) {
+        if cqe.result >= 0 {
+            // SAFETY: see complete
+            drop(unsafe { OwnedFd::from_raw_fd(cqe.result) });
+        }
+    }
+}
+
+struct RecvOp<C> {
+    fd: RawFd,
+    consumer: C,
+}
+
+impl<C: RecvConsumer> MultishotOp for RecvOp<C> {
+    fn sqe(&self, buf_ring: &BufRing) -> squeue::Entry {
+        buf_ring.recv_multi(self.fd)
+    }
+
+    fn complete(&mut self, buf_ring: &mut BufRing, cqe: RawCqe) -> bool {
+        if cqe.result > 0 {
+            let bid = cqueue::buffer_select(cqe.flags).expect("recv completion without buffer");
+            let buf = RecvBuf { bid: BufId(bid), len: cqe.result as usize };
+            self.consumer.on_data(buf_ring.data(buf));
+            buf_ring.release(buf.bid);
+            buf_ring.flush();
+            return true;
+        }
+        self.discard(buf_ring, cqe);
+        // the buffer ring ran dry, the stream is intact
+        if cqe.result == -libc::ENOBUFS {
+            return true;
+        }
+        self.consumer.on_end((cqe.result < 0).then(|| io::Error::from_raw_os_error(-cqe.result)));
+        false
+    }
+
+    fn discard(&self, buf_ring: &mut BufRing, cqe: RawCqe) {
+        if let Some(bid) = cqueue::buffer_select(cqe.flags) {
+            buf_ring.release(BufId(bid));
+            buf_ring.flush();
+        }
+    }
+}
+
+/// A live op is armed, queued in `UringContext::rearm`, or inside its callback.
+struct Multishot {
+    op: Box<dyn MultishotOp>,
+    /// the kernel holds the op
+    armed: bool,
+    /// the op is in `UringContext::rearm`
+    queued: bool,
+    /// the handle is gone; completions are discarded, the slot is freed once unarmed
+    cancelled: bool,
+}
+
+impl UringContext {
+    fn submit_multishot(&mut self, op: Box<dyn MultishotOp>) -> OpId {
+        let (op_id, opref) = self.register_new_pending_op().expect("No slots available");
+        opref.multi = Some(Box::new(Multishot { op, armed: false, queued: true, cancelled: false }));
+        self.rearm.push(op_id);
+        op_id
+    }
+
+    /// Submits queued multishot ops; stops at a full SQ and retries on the next call.
+    /// Frees cancelled ones. Never runs inside completion handling.
+    fn arm_multishot(&mut self) {
+        if self.am_in_completion.get() {
+            return;
+        }
+        while let Some(op_id) = self.rearm.last().copied() {
+            let slot = op_id.slot() as usize;
+            let pending_op = &mut self.slots[slot];
+            assert_eq!(pending_op.uid, op_id.uid(), "stale rearm entry");
+            let state = pending_op.multi.as_deref_mut().expect("not a multishot op");
+            debug_assert!(state.queued && !state.armed);
+            if state.cancelled {
+                self.rearm.pop();
+                *pending_op = PendingOp::empty(self.stats.submission_epoch);
+                self.free_slots.push(op_id.slot());
+                continue;
+            }
+            let sqe = state.op.sqe(&self.buf_ring).user_data(op_id.into_user_data());
+            if self.enqueue(sqe).is_err() {
+                log::debug!("SQ full, deferring multishot arm of {:?}", op_id);
+                return;
+            }
+            self.rearm.pop();
+            let state = self.slots[slot].multi.as_deref_mut().expect("not a multishot op");
+            state.queued = false;
+            state.armed = true;
+        }
+    }
+
+    /// No more callbacks. An armed op is cancelled, an idle one freed by `arm_multishot`.
+    fn cancel_multishot(&mut self, op_id: OpId) {
+        let slot = op_id.slot() as usize;
+        let state = match self.slots.get_mut(slot) {
+            Some(pending_op) if pending_op.uid == op_id.uid() => pending_op.multi.as_deref_mut().expect("not a multishot op"),
+            _ => return,
+        };
+        debug_assert!(!state.cancelled);
+        state.cancelled = true;
+        if state.armed {
+            let cancel = opcode::AsyncCancel::new(op_id.into_user_data()).build().user_data(Self::CANCEL_USER_DATA);
+            self.enqueue_retry_once(cancel).expect("couldn't enqueue uring cancel after 2 tries");
+        } else if !state.queued {
+            state.queued = true;
+            self.rearm.push(op_id);
+        }
+    }
+}
+
+impl ThreadUring {
+    pub fn accept_multi(&self, listener: &impl AsRawFd, consumer: impl AcceptConsumer) -> MultishotHandle {
+        self.multishot(Box::new(AcceptOp { fd: listener.as_raw_fd(), consumer }))
+    }
+
+    pub fn recv_multi(&self, sock: &impl AsRawFd, consumer: impl RecvConsumer) -> MultishotHandle {
+        self.multishot(Box::new(RecvOp { fd: sock.as_raw_fd(), consumer }))
+    }
+
+    fn multishot(&self, op: Box<dyn MultishotOp>) -> MultishotHandle {
+        let op_id = self.access(|ctx| ctx.submit_multishot(op));
+        MultishotHandle { context: self.clone(), op_id }
     }
 }
 
@@ -1707,5 +1956,397 @@ mod tests {
         let blksize = context.get_file_size(fd).await;
         println!("got {:?}", blksize);
         assert!(matches!(blksize, Ok((_, FileSizeType::Block))));
+    }
+}
+
+#[cfg(test)]
+mod multishot_tests {
+    use super::*;
+    use crate::io::buf_ring::BUF_SIZE;
+    use crate::runtime::*;
+    use std::cell::RefCell;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Accepted {
+        conns: Vec<OwnedFd>,
+        err: Option<io::Error>,
+    }
+
+    struct AcceptRec(Rc<RefCell<Accepted>>);
+
+    impl AcceptConsumer for AcceptRec {
+        fn on_accept(&mut self, conn: OwnedFd) {
+            self.0.borrow_mut().conns.push(conn);
+        }
+        fn on_end(&mut self, err: io::Error) {
+            self.0.borrow_mut().err = Some(err);
+        }
+    }
+
+    #[derive(Default)]
+    struct Received {
+        data: Vec<Vec<u8>>,
+        end: Option<Option<io::Error>>,
+    }
+
+    struct RecvRec(Rc<RefCell<Received>>);
+
+    impl RecvConsumer for RecvRec {
+        fn on_data(&mut self, data: &[u8]) {
+            self.0.borrow_mut().data.push(data.to_vec());
+        }
+        fn on_end(&mut self, err: Option<io::Error>) {
+            assert!(self.0.borrow_mut().end.replace(err).is_none(), "on_end called twice");
+        }
+    }
+
+    fn listen(io: &ThreadUring) -> (TcpListener, SocketAddr) {
+        let listener = io.tcp_listener(([127, 0, 0, 1], 0)).expect("listen failed");
+        let addr = listener.local_addr().expect("no local addr");
+        (listener, addr)
+    }
+
+    fn connect(addr: SocketAddr) -> TcpStream {
+        TcpStream::connect(addr).expect("connect failed")
+    }
+
+    /// Drives the ring by hand until `done` holds.
+    fn drive(io: &ThreadUring, mut done: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if done() {
+                return;
+            }
+            io.access(|ctx| ctx.enter(IOEnterIntent::Poll)).expect("enter failed");
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        panic!("timeout driving the ring");
+    }
+
+    fn submit(io: &ThreadUring) {
+        io.access(|ctx| ctx.enter(IOEnterIntent::Submit)).expect("enter failed");
+    }
+
+    fn small_ring(buf_ring_entries: u16) -> ThreadUring {
+        ThreadUring::new_with(|cfg| {
+            cfg.sq_entries = 8;
+            cfg.cq_entries = 8;
+            cfg.buf_ring_entries = buf_ring_entries;
+        })
+        .expect("ring creation failed")
+    }
+
+    /// Accepts one connection and returns both ends.
+    fn accepted_pair(io: &ThreadUring, addr: SocketAddr, accepted: &Rc<RefCell<Accepted>>) -> (TcpStream, OwnedFd) {
+        let client = connect(addr);
+        drive(io, || !accepted.borrow().conns.is_empty());
+        let conn = accepted.borrow_mut().conns.pop().unwrap();
+        (client, conn)
+    }
+
+    /// Fills the SQ with timeouts nobody waits for; -ETIME on a stale slot is ignored.
+    fn fill_sq(io: &ThreadUring, ts: &types::Timespec) {
+        let stale = OpId::new(0, 0xFFFF_0000).into_user_data();
+        io.access(|ctx| {
+            for _ in 0..8 {
+                ctx.enqueue(opcode::Timeout::new(ts).build().user_data(stale)).expect("SQ has room");
+            }
+        });
+    }
+
+    #[test]
+    fn test_arm_waits_for_free_sqe() {
+        let io = small_ring(512);
+        let (listener, addr) = listen(&io);
+        let ts = types::Timespec::new().sec(1);
+        fill_sq(&io, &ts);
+        let accepted = Rc::new(RefCell::new(Accepted::default()));
+        let _accept = io.accept_multi(&listener, AcceptRec(accepted.clone()));
+        assert_eq!(io.current_outstanding(), 8, "arm must wait for a free SQE");
+        submit(&io);
+        assert_eq!(io.current_outstanding(), 8, "SQ is still full at the top of enter");
+        submit(&io);
+        assert_eq!(io.current_outstanding(), 9, "armed on the next enter");
+        let _client = connect(addr);
+        drive(&io, || accepted.borrow().conns.len() == 1);
+    }
+
+    #[test]
+    fn test_rearm_after_cq_full() {
+        let io = small_ring(512);
+        let (listener, addr) = listen(&io);
+        let accepted = Rc::new(RefCell::new(Accepted::default()));
+        let _accept = io.accept_multi(&listener, AcceptRec(accepted.clone()));
+        submit(&io);
+        // more connections than CQ entries: the kernel stops the multishot
+        let _clients: Vec<TcpStream> = (0..12).map(|_| connect(addr)).collect();
+        std::thread::sleep(Duration::from_millis(20));
+        drive(&io, || accepted.borrow().conns.len() == 12);
+        assert!(accepted.borrow().err.is_none());
+        assert_eq!(io.current_outstanding(), 1, "accept is armed again");
+    }
+
+    /// `queued`: the recv waits for a free SQE while the peer acts.
+    /// `error`: the peer writes once and resets; otherwise it writes twice, then closes.
+    fn recv_scenario(queued: bool, error: bool) {
+        let io = small_ring(512);
+        let (listener, addr) = listen(&io);
+        let accepted = Rc::new(RefCell::new(Accepted::default()));
+        let _accept = io.accept_multi(&listener, AcceptRec(accepted.clone()));
+        submit(&io);
+        let (client, conn) = accepted_pair(&io, addr, &accepted);
+        let mut client = Some(client);
+        let ts = types::Timespec::new().sec(1);
+        if queued {
+            fill_sq(&io, &ts);
+        }
+        let received = Rc::new(RefCell::new(Received::default()));
+        let _recv = io.recv_multi(&conn, RecvRec(received.clone()));
+        let base = if queued { 9 } else { 1 };
+        assert_eq!(io.current_outstanding(), base);
+        client.as_mut().unwrap().write_all(b"payload").unwrap();
+        if error {
+            // linger 0 turns the close into a reset
+            socket2::SockRef::from(client.as_ref().unwrap()).set_linger(Some(Duration::ZERO)).unwrap();
+            client = None;
+        }
+        submit(&io);
+        if queued {
+            assert_eq!(io.current_outstanding(), base, "SQ still full at the top of enter");
+            submit(&io);
+        }
+        assert_eq!(io.current_outstanding(), base + 1, "recv armed");
+        if let Some(mut client) = client.take() {
+            drive(&io, || received.borrow().data.len() == 1);
+            assert_eq!(received.borrow().data[0], b"payload");
+            client.write_all(b"more").unwrap();
+            drive(&io, || received.borrow().data.len() == 2);
+            assert_eq!(received.borrow().data[1], b"more");
+            drop(client);
+            drive(&io, || received.borrow().end.is_some());
+            assert!(received.borrow().end.as_ref().unwrap().is_none(), "EOF ends the recv");
+        } else {
+            drive(&io, || received.borrow().end.is_some());
+            let received = received.borrow();
+            // data delivered before the reset is optional, the error is not
+            let err = received.end.as_ref().unwrap().as_ref().expect("recv must not end cleanly");
+            assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
+            for data in received.data.iter() {
+                assert_eq!(data, b"payload");
+            }
+        }
+        drive(&io, || io.current_outstanding() == 1);
+    }
+
+    #[test]
+    fn test_recv_armed_socket_open() {
+        recv_scenario(false, false);
+    }
+
+    #[test]
+    fn test_recv_queued_socket_open() {
+        recv_scenario(true, false);
+    }
+
+    #[test]
+    fn test_recv_queued_socket_error() {
+        recv_scenario(true, true);
+    }
+
+    #[test]
+    fn test_recv_armed_socket_error() {
+        recv_scenario(false, true);
+    }
+
+    #[test]
+    fn test_recv_rearms_after_enobufs() {
+        let io = small_ring(2);
+        let (listener, addr) = listen(&io);
+        let accepted = Rc::new(RefCell::new(Accepted::default()));
+        let _accept = io.accept_multi(&listener, AcceptRec(accepted.clone()));
+        submit(&io);
+        let (mut client, conn) = accepted_pair(&io, addr, &accepted);
+        let received = Rc::new(RefCell::new(Received::default()));
+        let _recv = io.recv_multi(&conn, RecvRec(received.clone()));
+        submit(&io);
+        // one buffer more than the ring holds
+        let payload = vec![7u8; 3 * BUF_SIZE];
+        client.write_all(&payload).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        drive(&io, || received.borrow().data.iter().map(Vec::len).sum::<usize>() == payload.len());
+        let received = received.borrow();
+        assert!(received.end.is_none(), "ENOBUFS must not end the stream");
+        assert!(received.data.iter().all(|d| d.iter().all(|&b| b == 7)));
+        assert_eq!(io.current_outstanding(), 2, "recv is armed again");
+    }
+
+    #[test]
+    fn test_drop_releases_buffers() {
+        let io = small_ring(2);
+        let (listener, addr) = listen(&io);
+        let accepted = Rc::new(RefCell::new(Accepted::default()));
+        let _accept = io.accept_multi(&listener, AcceptRec(accepted.clone()));
+        submit(&io);
+        let (mut client, conn) = accepted_pair(&io, addr, &accepted);
+        let received = Rc::new(RefCell::new(Received::default()));
+        let recv = io.recv_multi(&conn, RecvRec(received.clone()));
+        submit(&io);
+        // the kernel fills both buffers, nobody harvests them
+        client.write_all(&vec![1u8; 2 * BUF_SIZE]).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        drop(recv);
+        drive(&io, || io.current_outstanding() == 1);
+        assert!(received.borrow().data.is_empty(), "no callbacks after cancel");
+        assert!(received.borrow().end.is_none());
+        // both buffers are back in the ring: a fresh recv sees the next message
+        let received = Rc::new(RefCell::new(Received::default()));
+        let _recv = io.recv_multi(&conn, RecvRec(received.clone()));
+        submit(&io);
+        client.write_all(b"read").unwrap();
+        drive(&io, || received.borrow().data.len() == 1);
+        assert_eq!(received.borrow().data[0], b"read");
+    }
+
+    #[apply(async_test)]
+    async fn test_accept_multi() {
+        let io = test_exec().io().clone();
+        let (listener, addr) = listen(&io);
+        let accepted = Rc::new(RefCell::new(Accepted::default()));
+        let accept = io.accept_multi(&listener, AcceptRec(accepted.clone()));
+        let clients: Vec<TcpStream> = (0..3).map(|_| connect(addr)).collect();
+        while accepted.borrow().conns.len() < 3 {
+            io.sleep(Duration::from_millis(1)).await.unwrap();
+        }
+        for (client, conn) in clients.iter().zip(accepted.borrow().conns.iter()) {
+            assert_eq!(client.local_addr().unwrap(), TcpStream::from(conn.try_clone().unwrap()).peer_addr().unwrap());
+        }
+        // accepted by the kernel but not harvested: cancelling closes them
+        let mut late: Vec<TcpStream> = (0..2).map(|_| connect(addr)).collect();
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(io.current_outstanding(), 1);
+        drop(accept);
+        io.sleep(Duration::from_millis(5)).await.unwrap();
+        assert_eq!(io.current_outstanding(), 0);
+        assert_eq!(accepted.borrow().conns.len(), 3);
+        for client in late.iter_mut() {
+            client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            assert_eq!(client.read(&mut [0u8; 1]).expect("read failed"), 0);
+        }
+    }
+
+    #[apply(async_test)]
+    async fn test_recv_multi() {
+        let io = test_exec().io().clone();
+        let (listener, addr) = listen(&io);
+        let accepted = Rc::new(RefCell::new(Accepted::default()));
+        let accept = io.accept_multi(&listener, AcceptRec(accepted.clone()));
+        let mut client = connect(addr);
+        while accepted.borrow().conns.is_empty() {
+            io.sleep(Duration::from_millis(1)).await.unwrap();
+        }
+        let conn = accepted.borrow_mut().conns.pop().unwrap();
+        let received = Rc::new(RefCell::new(Received::default()));
+        let recv = io.recv_multi(&conn, RecvRec(received.clone()));
+        for (i, msg) in [&b"ping"[..], &b"pong"[..]].into_iter().enumerate() {
+            client.write_all(msg).unwrap();
+            while received.borrow().data.len() <= i {
+                io.sleep(Duration::from_millis(1)).await.unwrap();
+            }
+            assert_eq!(received.borrow().data[i], msg);
+        }
+        drop(client);
+        while received.borrow().end.is_none() {
+            io.sleep(Duration::from_millis(1)).await.unwrap();
+        }
+        assert!(received.borrow().end.as_ref().unwrap().is_none());
+        assert_eq!(io.current_outstanding(), 1, "the ended recv freed its slot");
+        drop(recv);
+        drop(accept);
+        io.sleep(Duration::from_millis(5)).await.unwrap();
+        assert_eq!(io.current_outstanding(), 0);
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    //  accept consumer that starts a recv per connection
+
+    #[derive(Default)]
+    struct Table {
+        conns: Vec<(RawFd, OwnedFd, MultishotHandle)>,
+        data: Vec<(RawFd, Vec<u8>)>,
+        closed: Vec<RawFd>,
+    }
+
+    struct Dispatch {
+        io: ThreadUring,
+        table: Rc<RefCell<Table>>,
+    }
+
+    impl AcceptConsumer for Dispatch {
+        fn on_accept(&mut self, conn: OwnedFd) {
+            let fd = conn.as_raw_fd();
+            let recv = self.io.recv_multi(&conn, Stream { fd, table: self.table.clone() });
+            self.table.borrow_mut().conns.push((fd, conn, recv));
+        }
+        fn on_end(&mut self, err: io::Error) {
+            panic!("accept failed: {}", err);
+        }
+    }
+
+    struct Stream {
+        fd: RawFd,
+        table: Rc<RefCell<Table>>,
+    }
+
+    impl RecvConsumer for Stream {
+        fn on_data(&mut self, data: &[u8]) {
+            self.table.borrow_mut().data.push((self.fd, data.to_vec()));
+        }
+        /// Drops the own handle from within the callback.
+        fn on_end(&mut self, err: Option<io::Error>) {
+            assert!(err.is_none(), "unexpected recv error {:?}", err);
+            let mut table = self.table.borrow_mut();
+            let idx = table.conns.iter().position(|c| c.0 == self.fd).expect("unknown connection");
+            drop(table.conns.remove(idx));
+            table.closed.push(self.fd);
+        }
+    }
+
+    #[apply(async_test)]
+    async fn test_dispatch() {
+        let io = test_exec().io().clone();
+        let (listener, addr) = listen(&io);
+        let table = Rc::new(RefCell::new(Table::default()));
+        let accept = io.accept_multi(&listener, Dispatch { io: io.clone(), table: table.clone() });
+        let mut a = connect(addr);
+        let mut b = connect(addr);
+        a.write_all(b"from a").unwrap();
+        b.write_all(b"from b").unwrap();
+        while table.borrow().data.len() < 2 {
+            io.sleep(Duration::from_millis(1)).await.unwrap();
+        }
+        {
+            let table = table.borrow();
+            assert_ne!(table.data[0].0, table.data[1].0, "one connection per client");
+            let mut msgs: Vec<&[u8]> = table.data.iter().map(|(_, d)| d.as_slice()).collect();
+            msgs.sort();
+            assert_eq!(msgs, [&b"from a"[..], &b"from b"[..]]);
+        }
+        drop(a);
+        while table.borrow().closed.is_empty() {
+            io.sleep(Duration::from_millis(1)).await.unwrap();
+        }
+        assert_eq!(table.borrow().conns.len(), 1);
+        assert_eq!(io.current_outstanding(), 2, "accept and one recv");
+        b.write_all(b"still open").unwrap();
+        while table.borrow().data.len() < 3 {
+            io.sleep(Duration::from_millis(1)).await.unwrap();
+        }
+        assert_eq!(table.borrow().data[2].1, b"still open");
+        table.borrow_mut().conns.clear();
+        drop(accept);
+        io.sleep(Duration::from_millis(5)).await.unwrap();
+        assert_eq!(io.current_outstanding(), 0);
     }
 }

@@ -1,5 +1,6 @@
 pub mod buf_ring;
 pub mod buffer;
+pub mod framing;
 pub mod send_buffer;
 pub mod uring;
 pub mod watermark;
