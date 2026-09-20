@@ -2,6 +2,8 @@
 
 ## Scope
 
+Read: /home/lukas/.claude/projects/-home-lukas-btrlog/memory/tcp-receive-path-design.md
+
 The goal is implement a TCP networking layer for BTRLOG. Currently only UDP is implemented. On the send side TCP buffers into iovec for sending to comply with urings one 
 outstanding send per stream limit.
 
