@@ -10,10 +10,20 @@ use crate::runtime::waker_chain::WakerList;
 
 use super::buffer::IoBuf;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StreamState {
+    Idle,
+    Queued,
+    Kernel,
+}
+
 #[derive(Default)]
 struct IoBufWakerContext {
     buf: Option<IoBuf>,
     waker: Option<Waker>,
+    err: i32,
+    woken: bool,
+    generation: u32,
 }
 
 struct StreamSlotStore {
@@ -46,19 +56,39 @@ impl StreamSlotStore {
     fn free_slot(&mut self, idx: usize) {
         self.free.push_front(idx);
     }
+
+    fn release(&mut self, idx: usize) -> (Option<IoBuf>, io::Result<usize>) {
+        let slot = self.slot_at_mut(idx);
+        let buf = slot.buf.take();
+        slot.waker = None;
+        slot.woken = false;
+        let err = -slot.err;
+        let sent = buf.as_ref().unwrap().used_bytes();
+        slot.err = 0;
+        slot.generation = slot.generation.wrapping_add(1);
+        self.free_slot(idx);
+        (
+            buf,
+            if err == 0 {
+                Ok(sent)
+            } else {
+                Err(io::Error::from_raw_os_error(err))
+            },
+        )
+    }
 }
 
 pub(crate) struct SendStreamFuture {
-    polled_once: Cell<bool>,
-    idx: usize,
+    idx: Cell<Option<usize>>,
+    generation: u32,
     slots: Rc<UnsafeCell<StreamSlotStore>>,
 }
 
 impl SendStreamFuture {
-    fn new(idx: usize, slots: Rc<UnsafeCell<StreamSlotStore>>) -> Self {
+    fn new(idx: usize, generation: u32, slots: Rc<UnsafeCell<StreamSlotStore>>) -> Self {
         Self {
-            polled_once: Cell::new(false),
-            idx,
+            idx: Cell::new(Some(idx)),
+            generation,
             slots,
         }
     }
@@ -69,46 +99,65 @@ impl SendStreamFuture {
 }
 
 impl Future for SendStreamFuture {
-    type Output = IoBuf;
+    type Output = (io::Result<usize>, IoBuf);
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        if !self.polled_once.get() {
+        let idx = self.idx.get().expect("polled after completion");
+        let (ready, err) = self.access_state(|state| {
+            debug_assert_eq!(state.slot_at(idx).generation, self.generation);
+            if !state.slot_at(idx).woken {
+                state.slot_at_mut(idx).waker = Some(cx.waker().clone());
+                return (None, Ok(0));
+            }
+            self.idx.set(None);
+            let res = state.release(idx);
+            state.wakers.pop_wake_one();
+            res
+        });
+        match ready {
+            None => Poll::Pending,
+            Some(buf) => Poll::Ready((err, buf)),
+        }
+    }
+}
+
+impl Drop for SendStreamFuture {
+    fn drop(&mut self) {
+        if let Some(idx) = self.idx.get() {
             self.access_state(|state| {
-                state.slots[self.idx].waker = Some(cx.waker().clone());
-            });
-            self.polled_once.set(true);
-            Poll::Pending
-        } else {
-            let buf = self.access_state(|state| {
-                let buf = state.slot_at_mut(self.idx).buf.take().unwrap();
-                state.free_slot(self.idx);
-                buf
-            });
-            self.access_state(|state| state.wakers.pop_wake_one());
-            Poll::Ready(buf)
+                let _ = state.release(idx);
+            })
         }
     }
 }
 
 pub struct SendStreamState {
     iovec: Box<[libc::iovec]>,
-    stream_order: Box<[usize]>,
+    stream_order: Box<[(usize, u32)]>,
     slots: Rc<UnsafeCell<StreamSlotStore>>,
     head: usize,
     len: usize,
+    msghdr: libc::msghdr,
+    state: StreamState,
 }
 
 impl SendStreamState {
     pub fn new(len: usize) -> Self {
         Self {
             iovec: vec![Self::empty_iovec(); len].into_boxed_slice(),
-            stream_order: vec![0; len].into_boxed_slice(),
+            stream_order: vec![(0, 0); len].into_boxed_slice(),
             slots: Rc::new(UnsafeCell::new(StreamSlotStore::new(len))),
             head: 0,
             len,
+            msghdr: unsafe { std::mem::zeroed() },
+            state: StreamState::Idle,
         }
+    }
+
+    pub fn state(&self) -> StreamState {
+        self.state
     }
 
     const fn empty_iovec() -> libc::iovec {
@@ -122,33 +171,44 @@ impl SendStreamState {
         unsafe { f(&mut *self.slots.get()) }
     }
 
-    pub fn prepare_iovec(&mut self) -> (&mut [libc::iovec], usize) {
-        (self.iovec.as_mut(), self.head)
-    }
-
-    pub async fn put(&mut self, buf: IoBuf) -> IoBuf {
-        assert!(self.head < self.len, "iovec ring is full");
-
+    pub(crate) async fn stage(&mut self, buf: IoBuf) -> (SendStreamFuture, bool) {
         let idx = self.acquire_slot().await;
+        assert!(self.head < self.len, "iovec ring is full");
 
         let iovec_item = libc::iovec {
             iov_base: unsafe { buf.type_erased_ptr() } as *mut c_void,
             iov_len: buf.used_bytes(),
         };
 
-        self.access_state(|state| {
-            *state.slot_at_mut(idx) = IoBufWakerContext {
-                err: None,
-                buf: Some(buf),
-                waker: None,
-            };
+        let generation = self.access_state(|state| {
+            let slot = state.slot_at_mut(idx);
+            slot.buf = Some(buf);
+            slot.waker = None;
+            slot.err = 0;
+            slot.woken = false;
+            slot.generation
         });
 
-        self.stream_order[self.head] = idx;
+        self.stream_order[self.head] = (idx, generation);
         self.iovec[self.head] = iovec_item;
         self.head += 1;
 
-        SendStreamFuture::new(idx, self.slots.clone()).await
+        let queue = self.state == StreamState::Idle;
+        if queue {
+            self.state = StreamState::Queued;
+        }
+        (
+            SendStreamFuture::new(idx, generation, self.slots.clone()),
+            queue,
+        )
+    }
+
+    pub fn prepare(&mut self) -> *const libc::msghdr {
+        assert!(self.state == StreamState::Queued && self.head > 0);
+        self.msghdr.msg_iov = self.iovec.as_mut_ptr();
+        self.msghdr.msg_iovlen = self.head;
+        self.state = StreamState::Kernel;
+        &self.msghdr
     }
 
     async fn acquire_slot(&mut self) -> usize {
@@ -161,8 +221,28 @@ impl SendStreamState {
         }
     }
 
-    pub fn reap(&mut self, ret: io::Result<usize>) {
-        let mut sent = ret.unwrap();
+    pub fn fail(&mut self, err: i32) -> bool {
+        for &(idx, generation) in &self.stream_order[..self.head] {
+            let waker = self.access_state(|state| {
+                let slot = state.slot_at_mut(idx);
+                if slot.generation != generation {
+                    return None;
+                }
+                assert_eq!(slot.err, 0);
+                slot.woken = true;
+                slot.err = err;
+                slot.waker.take()
+            });
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+        self.head = 0;
+        false
+    }
+
+    pub fn reap(&mut self, mut sent: usize) -> bool {
+        assert_eq!(self.state, StreamState::Kernel);
         let mut last = 0usize;
         for _ in 0..self.head {
             if self.iovec[last].iov_len > sent {
@@ -171,18 +251,28 @@ impl SendStreamState {
                 break;
             }
             sent -= self.iovec[last].iov_len;
+            let (idx, generation) = self.stream_order[last];
             let waker = self.access_state(|state| {
-                state
-                    .slot_at(self.stream_order[last])
-                    .waker
-                    .clone()
-                    .unwrap()
+                let slot = state.slot_at_mut(idx);
+                if slot.generation != generation {
+                    return None;
+                }
+                slot.woken = true;
+                slot.waker.take()
             });
-            waker.wake();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
             last += 1;
         }
         self.stream_order.copy_within(last..self.head, 0);
         self.iovec.copy_within(last..self.head, 0);
         self.head -= last;
+        self.state = if self.head > 0 {
+            StreamState::Queued
+        } else {
+            StreamState::Idle
+        };
+        self.head > 0
     }
 }

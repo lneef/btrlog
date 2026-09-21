@@ -3,6 +3,8 @@ pub mod buffer;
 pub mod framing;
 pub mod send_buffer;
 pub mod send_stream;
+pub mod session;
+pub mod slot_storage;
 pub mod uring;
 pub mod watermark;
 
@@ -25,7 +27,11 @@ pub fn local_buffer_pool(size: usize, cfg: BufferPoolConfig) -> ThreadBuffers {
     } else {
         size.ilog2() + 1
     };
-    IO_BUFFERS.with(|bufs| bufs[idx as usize].get_or_init(move || Rc::new(buffer::LocalBufferPool::new(1 << idx, cfg))).clone())
+    IO_BUFFERS.with(|bufs| {
+        bufs[idx as usize]
+            .get_or_init(move || Rc::new(buffer::LocalBufferPool::new(1 << idx, cfg)))
+            .clone()
+    })
 }
 
 #[inline]
@@ -35,7 +41,11 @@ pub fn local_buffer_pool_size_ceil(size: usize, cfg: BufferPoolConfig) -> Thread
     } else {
         size.ilog2() - 1
     };
-    IO_BUFFERS.with(|bufs| bufs[idx as usize].get_or_init(move || Rc::new(buffer::LocalBufferPool::new(1 << idx, cfg))).clone())
+    IO_BUFFERS.with(|bufs| {
+        bufs[idx as usize]
+            .get_or_init(move || Rc::new(buffer::LocalBufferPool::new(1 << idx, cfg)))
+            .clone()
+    })
 }
 
 pub static MAX_PACKET_SIZE: usize = 1 << 16;

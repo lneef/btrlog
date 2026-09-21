@@ -301,6 +301,7 @@ fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::Error + Se
         allow_parking: true,
         syscall_timeout_us: config.syscall_timeout_us,
         buf_ring_entries: 512,
+        napi: Default::default(),
     })
     .map_err(|e| format!("Failed to create io_uring: {}", e))?;
 

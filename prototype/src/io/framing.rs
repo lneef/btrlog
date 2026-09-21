@@ -1,7 +1,6 @@
 use std::io;
 
 use super::buffer::IoBuf;
-use super::uring::RecvConsumer;
 use super::{MAX_PACKET_SIZE, ThreadBuffers, local_packet_buffer_pool};
 use crate::types::packet::PacketHeader;
 use crate::types::wire::auto::WireMessage as _;
@@ -99,8 +98,9 @@ impl<C: MessageConsumer> MessageFramer<C> {
     }
 }
 
-impl<C: MessageConsumer> RecvConsumer for MessageFramer<C> {
-    fn on_data(&mut self, data: &[u8]) {
+impl<C: MessageConsumer> MessageFramer<C> {
+    /// Feeds one recv fragment. `data` is valid during the call only.
+    pub fn on_data(&mut self, data: &[u8]) {
         if self.dead {
             return;
         }
@@ -111,7 +111,8 @@ impl<C: MessageConsumer> RecvConsumer for MessageFramer<C> {
         }
     }
 
-    fn on_end(&mut self, err: Option<io::Error>) {
+    /// The stream ended: recv error or `None` for a clean close.
+    pub fn on_end(&mut self, err: Option<io::Error>) {
         if self.dead {
             return;
         }

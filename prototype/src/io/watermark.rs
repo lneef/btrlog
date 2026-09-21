@@ -153,7 +153,12 @@ pub struct WatermarkRecv<Consumer> {
 }
 
 impl<Consumer: PacketConsumer> WatermarkRecv<Consumer> {
-    pub fn new(sock: impl std::os::fd::AsRawFd, io: ThreadUring, watermark: u16, consumer: Consumer) -> Rc<Self> {
+    pub fn new(
+        sock: impl std::os::fd::AsRawFd,
+        io: ThreadUring,
+        watermark: u16,
+        consumer: Consumer,
+    ) -> Rc<Self> {
         let iodepth = io.iodepth();
         let res = Rc::new(Self {
             socket: sock.as_raw_fd(),
@@ -193,7 +198,9 @@ impl<Consumer: PacketConsumer> WatermarkRecv<Consumer> {
         let _op_id = self.io.access(|context| {
             let buf = self.bufpool.pop();
             // Allocate a slot and get op_id
-            let (op_id, buf) = context.register_buffer_op(buf).expect("No free slots available");
+            let (op_id, buf) = context
+                .register_buffer_op(buf)
+                .expect("No free slots available");
             self.access(|state| state.prepare_new_message_slot(op_id));
             match self.submit_recv_op(op_id, buf) {
                 Ok(_) => {}
@@ -213,11 +220,16 @@ impl<Consumer: PacketConsumer> WatermarkRecv<Consumer> {
         self.io
             .access(|ctx| {
                 ctx.poll_completions_callback(|opid, result, opref| {
-                    let (from, uid, _iobuf) = match self.access(|state| state.at(opid.slot()).map(|x| (x.0, x.1, x.2.iov_base))) {
+                    let (from, uid, _iobuf) = match self
+                        .access(|state| state.at(opid.slot()).map(|x| (x.0, x.1, x.2.iov_base)))
+                    {
                         Some(x) => x, // an I/O known by us
                         None => return OpCompletionAction::TryWake,
                     };
-                    let buf = std::mem::replace(unsafe { opref.buffer_ref().unwrap_unchecked() }, self.bufpool.pop());
+                    let buf = std::mem::replace(
+                        unsafe { opref.buffer_ref().unwrap_unchecked() },
+                        self.bufpool.pop(),
+                    );
                     debug_assert_eq!(uid, opid.uid());
                     debug_assert_eq!(_iobuf as *const u8, buf.ptr());
                     self.consumer.consume_raw(result, from, buf, opid);
@@ -227,12 +239,16 @@ impl<Consumer: PacketConsumer> WatermarkRecv<Consumer> {
                         log::error!("wind_down flag set, removing watermark task");
                         return OpCompletionAction::Drop;
                     }
-                    let res = self.submit_recv_op(opid, unsafe { opref.buffer_ref().unwrap_unchecked() });
+                    let res =
+                        self.submit_recv_op(opid, unsafe { opref.buffer_ref().unwrap_unchecked() });
                     match res {
                         Ok(_) => OpCompletionAction::ReuseSlot,
                         Err(_e) => {
                             self.access(|state| state.free_slot(opid.slot()));
-                            log::error!("error during recv op submit, removing watermark task: {}", _e);
+                            log::error!(
+                                "error during recv op submit, removing watermark task: {}",
+                                _e
+                            );
                             // XXX refill up to watermark after dropping this continuous I/O
                             OpCompletionAction::Drop
                         }
@@ -244,7 +260,9 @@ impl<Consumer: PacketConsumer> WatermarkRecv<Consumer> {
 
     /// XXX result
     fn submit_recv_op(&self, op_id: OpId, buf: &mut IoBuf) -> Result<(), std::io::Error> {
-        let msghdr = self.access(|state| state.set_msg_buffer(op_id, buf)).ok_or(std::io::Error::other("unknown slot"))?;
+        let msghdr = self
+            .access(|state| state.set_msg_buffer(op_id, buf))
+            .ok_or(std::io::Error::other("unknown slot"))?;
         let op = opcode::RecvMsg::new(types::Fd(self.socket), msghdr)
             .flags(libc::MSG_CMSG_CLOEXEC as u32)
             .build()
@@ -258,32 +276,42 @@ impl<Consumer: PacketConsumer> WatermarkRecv<Consumer> {
     }
 
     fn wake_inner(self: &Rc<Self>, tag: u16, register_new_waker: bool) {
-        let (from, opuid, _iobuf) = match self.access(|state| state.at(tag).map(|x| (x.0, x.1, x.2.iov_base))) {
-            Some(x) if x.1 != 0 => x,
-            Some(_x) => {
-                log::error!("op uid for slot {} is zero", tag);
-                return;
-            }
-            None => {
-                log::error!("slot {} not found in watermark state", tag);
-                return;
-            }
-        };
+        let (from, opuid, _iobuf) =
+            match self.access(|state| state.at(tag).map(|x| (x.0, x.1, x.2.iov_base))) {
+                Some(x) if x.1 != 0 => x,
+                Some(_x) => {
+                    log::error!("op uid for slot {} is zero", tag);
+                    return;
+                }
+                None => {
+                    log::error!("slot {} not found in watermark state", tag);
+                    return;
+                }
+            };
         let opid = OpId::new(tag, opuid);
         self.io.access(|uring| {
             uring.access_pending_op(opid, |opref| {
-                let buf = std::mem::replace(unsafe { opref.buffer_ref().unwrap_unchecked() }, self.bufpool.pop());
+                let buf = std::mem::replace(
+                    unsafe { opref.buffer_ref().unwrap_unchecked() },
+                    self.bufpool.pop(),
+                );
                 debug_assert_eq!(opref.op_uid(), opuid);
                 debug_assert_eq!(_iobuf as *const u8, buf.ptr());
                 debug_assert!(opref.result.is_some());
-                self.consumer.consume_raw(unsafe { opref.result.unwrap_unchecked() }, from, buf, opid);
+                self.consumer.consume_raw(
+                    unsafe { opref.result.unwrap_unchecked() },
+                    from,
+                    buf,
+                    opid,
+                );
                 // reuse operation slot directly by resubmitting an op with the same slot and ID
                 if self.wind_down.get() {
                     self.access(|state| state.free_slot(opid.slot()));
                     log::error!("wind_down flag set, removing watermark task");
                     return ((), OpCompletionAction::Drop);
                 }
-                let res = self.submit_recv_op(opid, unsafe { opref.buffer_ref().unwrap_unchecked() });
+                let res =
+                    self.submit_recv_op(opid, unsafe { opref.buffer_ref().unwrap_unchecked() });
                 if register_new_waker {
                     opref.set_waker(Self::new_rc_waker(&self, tag));
                 }
@@ -291,7 +319,10 @@ impl<Consumer: PacketConsumer> WatermarkRecv<Consumer> {
                     Ok(_) => ((), OpCompletionAction::ReuseSlot),
                     Err(_e) => {
                         self.access(|state| state.free_slot(opid.slot()));
-                        log::error!("error during recv op submit, removing watermark task: {}", _e);
+                        log::error!(
+                            "error during recv op submit, removing watermark task: {}",
+                            _e
+                        );
                         // XXX refill up to watermark after dropping this continuous I/O
                         ((), OpCompletionAction::Drop)
                     }
@@ -344,7 +375,10 @@ mod tests {
             for msg in msgs.into_iter() {
                 vec.push((msg, Cell::new(0)))
             }
-            Self { from, expected: vec }
+            Self {
+                from,
+                expected: vec,
+            }
         }
 
         fn all_done(&self) -> bool {
@@ -378,7 +412,8 @@ mod tests {
                 );
             }
             let bytes = &buf.as_slice()[0..(result as usize)];
-            let received = std::str::from_utf8(&bytes).expect("error converting received bytes to string");
+            let received =
+                std::str::from_utf8(&bytes).expect("error converting received bytes to string");
             let found = match self.expected.iter().find(|(s, _c)| s == received) {
                 Some(r) => r,
                 None => panic!("message {} not found in {:?}", received, self.expected),
@@ -412,7 +447,8 @@ mod tests {
                 let barrier = &barrier;
                 move || {
                     let ring = ThreadUring::new(Default::default()).expect("error creating uring");
-                    let sock = std::net::UdpSocket::bind(recv_addr).expect("error binding udp socket");
+                    let sock =
+                        std::net::UdpSocket::bind(recv_addr).expect("error binding udp socket");
                     let rawfd = sock.as_raw_fd();
                     // ----------------------------------------
                     // let mut buf = [0u8; 1024];
@@ -428,7 +464,12 @@ mod tests {
                     // }
                     // ----------------------------------------
                     barrier.wait();
-                    let watermark = WatermarkRecv::new(rawfd, ring.clone(), 4, MockConsumer::new(sender_addr, messages));
+                    let watermark = WatermarkRecv::new(
+                        rawfd,
+                        ring.clone(),
+                        4,
+                        MockConsumer::new(sender_addr, messages),
+                    );
                     while !watermark.consumer.all_done() {
                         watermark.poll_completed();
                     }
@@ -438,8 +479,14 @@ mod tests {
 
             barrier.wait();
             test_rt().with_executor(Default::default(), || async move {
-                let sock = test_exec().io().udp_bind(sender_addr).expect("error binding sender socket");
-                let _port = sock.local_addr().expect("error getting local address").port();
+                let sock = test_exec()
+                    .io()
+                    .udp_bind(sender_addr)
+                    .expect("error binding sender socket");
+                let _port = sock
+                    .local_addr()
+                    .expect("error getting local address")
+                    .port();
                 let bufpool = crate::io::local_packet_buffer_pool();
                 let fd = sock.as_raw_fd();
                 for msg in messages {
@@ -465,7 +512,11 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         };
 
-        let messages = vec!["wake1".to_string(), "wake2".to_string(), "wake3".to_string()];
+        let messages = vec![
+            "wake1".to_string(),
+            "wake2".to_string(),
+            "wake3".to_string(),
+        ];
         let recv_addr = ("127.0.4.30", 8300u16)
             .to_socket_addrs()
             .expect("error converting to socket addr")
@@ -488,12 +539,17 @@ mod tests {
                     // Use librt to drive the uring via wakers
                     test_rt().with_executor(Default::default(), || async move {
                         // Create a new uring that librt will drive
-                        let ring = ThreadUring::new(Default::default()).expect("error creating uring");
+                        let ring =
+                            ThreadUring::new(Default::default()).expect("error creating uring");
                         let sock = ring.udp_bind(recv_addr).expect("error binding recv socket");
                         let recv_fd = sock.as_raw_fd();
 
-                        let watermark =
-                            WatermarkRecv::new(recv_fd, ring.clone(), 4, MockConsumer::new(sender_addr, messages.clone()));
+                        let watermark = WatermarkRecv::new(
+                            recv_fd,
+                            ring.clone(),
+                            4,
+                            MockConsumer::new(sender_addr, messages.clone()),
+                        );
                         barrier.wait();
 
                         let mut poller = std::pin::pin!(ring.new_spurious_poller());
@@ -509,7 +565,11 @@ mod tests {
                             if check_count > 1000 {
                                 panic!("timeout waiting for watermark completion");
                             }
-                            test_exec().io().sleep(Duration::from_millis(1)).await.expect("error sleeping");
+                            test_exec()
+                                .io()
+                                .sleep(Duration::from_millis(1))
+                                .await
+                                .expect("error sleeping");
                         }
 
                         watermark.consumer.assert_all_received_exactly_once();
@@ -520,7 +580,10 @@ mod tests {
 
             // Sender using separate runtime
             test_rt().with_executor(Default::default(), || async move {
-                let sock = test_exec().io().udp_bind(sender_addr).expect("error binding sender socket");
+                let sock = test_exec()
+                    .io()
+                    .udp_bind(sender_addr)
+                    .expect("error binding sender socket");
                 let bufpool = crate::io::local_packet_buffer_pool();
 
                 barrier.wait();
@@ -530,7 +593,10 @@ mod tests {
                     let mut buf = bufpool.pop();
                     buf.as_mut_slice()[0..bytes.len()].copy_from_slice(bytes);
                     buf.mark_used(bytes.len());
-                    let (res, _buf) = test_exec().io().send_to(sock.as_raw_fd(), recv_addr, buf).await;
+                    let (res, _buf) = test_exec()
+                        .io()
+                        .send_to(sock.as_raw_fd(), recv_addr, buf)
+                        .await;
                     res.expect("error sending message");
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
