@@ -203,6 +203,7 @@ where
                         let header = PacketHeader {
                             msg_id: pkt.header.msg_id,
                             reply_to: self.port,
+                            stream_id: pkt.header.stream_id,
                             fragment_len: 0,
                         };
                         log::info!("replying to shutdown request {:?} with {:?}", pkt.header, header);
@@ -221,6 +222,7 @@ where
             let header = PacketHeader {
                 msg_id: pkt.header.msg_id,
                 reply_to: self.port,
+                stream_id: pkt.header.stream_id,
                 fragment_len: 0,
             };
             log::trace!(
@@ -313,6 +315,7 @@ where
                 header: PacketHeader {
                     msg_id: u64::MAX,
                     reply_to: 0,
+                    stream_id: 0,
                     fragment_len: 0,
                 },
                 request: JournalRequest::Shutdown,

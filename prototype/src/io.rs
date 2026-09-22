@@ -1,10 +1,11 @@
 pub mod buf_ring;
 pub mod buffer;
+pub mod client_state;
 pub mod framing;
 pub mod send_buffer;
-pub mod send_stream;
 pub mod session;
 pub mod slot_storage;
+pub mod stream;
 pub mod uring;
 pub mod watermark;
 

@@ -249,6 +249,7 @@ impl JournalQuorumDriver {
             header: PacketHeader {
                 msg_id: ((slot as u64) << 32) | (uid as u64),
                 reply_to: local_port,
+                stream_id: 0,
                 fragment_len: 0,
             },
             request: req,

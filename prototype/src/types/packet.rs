@@ -1,4 +1,4 @@
-use super::{message::*, wire::auto::*, wire::EncodeError};
+use super::{message::*, wire::auto::*, wire::{DecodeError, EncodeError}};
 
 // Messages that aren't sent as part of a persistent connection
 // additionally need an id to correlate requests with responses.
@@ -9,13 +9,22 @@ use super::{message::*, wire::auto::*, wire::EncodeError};
 pub struct PacketHeader {
     pub msg_id: u64,
     pub reply_to: u16,
+    pub stream_id: u32,
     // body bytes following the header
     pub fragment_len: u32,
 }
 
 impl PacketHeader {
-    // fixint encoding: u64 + u16 + u32
-    pub const WIRE_SIZE: usize = 8 + 2 + 4;
+    // fixint encoding: u64 + u16 + u32 + u32
+    pub const WIRE_SIZE: usize = 8 + 2 + 4 + 4;
+
+    // header prefix of a frame, None for fewer than WIRE_SIZE bytes
+    pub fn peek(bytes: &[u8]) -> Option<Result<Self, DecodeError>> {
+        if bytes.len() < Self::WIRE_SIZE {
+            return None;
+        }
+        Some(Self::decode_from(&bytes[..Self::WIRE_SIZE]).map(|(hdr, _)| hdr))
+    }
 }
 
 // header at dst[..WIRE_SIZE], body after it, fragment_len = body bytes
@@ -65,10 +74,28 @@ mod tests {
         let hdr = PacketHeader {
             msg_id: 0x0102030405060708,
             reply_to: 9,
+            stream_id: 0,
             fragment_len: 10,
         };
         let n = hdr.encode_into(&mut buf).unwrap();
         assert_eq!(n, PacketHeader::WIRE_SIZE);
+    }
+
+    #[test]
+    fn peek_header_prefix() {
+        let hdr = PacketHeader {
+            msg_id: 0x0102030405060708,
+            reply_to: 9,
+            stream_id: 3,
+            fragment_len: 4,
+        };
+        let mut buf = [0u8; 64];
+        let n = hdr.clone().encode_into(&mut buf).unwrap();
+        assert_eq!(n, PacketHeader::WIRE_SIZE);
+        buf[n..n + 4].copy_from_slice(b"body");
+        // trailing body bytes are ignored
+        assert_eq!(PacketHeader::peek(&buf[..n + 4]).unwrap().unwrap(), hdr);
+        assert!(PacketHeader::peek(&buf[..n - 1]).is_none());
     }
 
     #[test]
@@ -77,6 +104,7 @@ mod tests {
         let header = PacketHeader {
             msg_id: 42,
             reply_to: 7,
+            stream_id: 0,
             fragment_len: 0,
         };
         let mut framed = [0u8; RequestPacket::WIRE_SIZE_BOUND];
