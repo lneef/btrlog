@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
@@ -44,8 +44,6 @@ pub struct SendStats {
     pub behind: u64,
     /// completed sendmsgs
     pub sendmsgs: u64,
-    /// sendmsgs sent directly, without the ring
-    pub inline: u64,
 }
 
 enum Staged {
@@ -63,8 +61,6 @@ pub(crate) struct Session {
     /// the sendmsg the kernel holds
     send: Option<OpId>,
     recv: Option<OpId>,
-    /// direct sendmsgs since the last `take_send_stats`
-    inline: u64,
 }
 
 impl Session {
@@ -76,7 +72,6 @@ impl Session {
             health: SessionHealth::Healthy,
             send: None,
             recv: None,
-            inline: 0,
         }
     }
 
@@ -185,30 +180,8 @@ impl Session {
         if self.send.is_some() || self.manager.staged() == 0 || self.health != SessionHealth::Healthy {
             return;
         }
-        if io.inline_stream_send() && self.send_inline() {
-            return;
-        }
         let msg = self.manager.prepare();
         self.send = Some(io.send_stream(&self.fd, slot.slot(), msg));
-    }
-
-    /// True when a direct sendmsg ended every staged send, sent or failed.
-    fn send_inline(&mut self) -> bool {
-        let msg = self.manager.prepare();
-        // SAFETY: msg is the manager's msghdr over the staged buffers, alive for the call
-        let res = unsafe { libc::sendmsg(self.fd.as_raw_fd(), msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
-        if res > 0 {
-            self.inline += 1;
-            self.manager.reap(Ok(res as usize));
-            return self.manager.staged() == 0;
-        }
-        let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
-        if res == 0 || matches!(errno, libc::EAGAIN | libc::EINTR | libc::ENOBUFS) {
-            return false;
-        }
-        self.end(SessionHealth::Failed(-errno));
-        self.manager.reap(Err(-errno));
-        true
     }
 
     /// Ends the sendmsg in flight, then submits what was staged meanwhile.
@@ -317,8 +290,8 @@ impl SendStats {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
         eprintln!(
-            "send-stats role={} id={} unix_ms={} staged={} behind={} sendmsgs={} inline={}",
-            role, id, unix_ms, self.staged, self.behind, self.sendmsgs, self.inline
+            "send-stats role={} id={} unix_ms={} staged={} behind={} sendmsgs={}",
+            role, id, unix_ms, self.staged, self.behind, self.sendmsgs
         );
     }
 }
@@ -404,11 +377,7 @@ impl<C: MessageConsumer> SessionManager<C> {
                     return Poll::Ready(Err((libc::EBADF, taken)));
                 };
                 let behind = session.send.is_some();
-                let staged = session.stage(&self.io, addr.session, taken, addr.stream, cx.waker());
-                if session.health() != SessionHealth::Healthy {
-                    session.cancel_recv(&self.io);
-                }
-                match staged {
+                match session.stage(&self.io, addr.session, taken, addr.stream, cx.waker()) {
                     Staged::Sent(fut) => {
                         ctx.stats.staged += 1;
                         ctx.stats.behind += behind as u64;
@@ -437,11 +406,7 @@ impl<C: MessageConsumer> SessionManager<C> {
                 return Err((libc::EBADF, buf));
             };
             let behind = session.send.is_some();
-            let sent = session.send_detached(&self.io, addr.session, buf, addr.stream);
-            if session.health() != SessionHealth::Healthy {
-                session.cancel_recv(&self.io);
-            }
-            sent?;
+            session.send_detached(&self.io, addr.session, buf, addr.stream)?;
             ctx.stats.staged += 1;
             ctx.stats.behind += behind as u64;
             Ok(())
@@ -451,13 +416,7 @@ impl<C: MessageConsumer> SessionManager<C> {
 
     /// True while the stream holds a staged send.
     pub fn take_send_stats(&self) -> SendStats {
-        self.access(|ctx| {
-            let mut stats = std::mem::take(&mut ctx.stats);
-            for session in ctx.socks.ids_mut() {
-                stats.inline += std::mem::take(&mut session.inline);
-            }
-            stats
-        })
+        self.access(|ctx| std::mem::take(&mut ctx.stats))
     }
 
     pub fn stream_busy(&self, addr: &SessionAddr) -> bool {
@@ -614,14 +573,9 @@ mod tests {
 
     /// Server manager with one accepted session and its peer.
     fn accepted() -> (SessionManager<Ends>, SessionId, TcpStream) {
-        accepted_with(false)
-    }
-
-    fn accepted_with(inline: bool) -> (SessionManager<Ends>, SessionId, TcpStream) {
         let io = ThreadUring::new_with(|cfg| {
             cfg.sq_entries = 8;
             cfg.cq_entries = 8;
-            cfg.inline_stream_send = inline;
         })
         .expect("ring creation failed");
         let listener = io.tcp_listener(([127, 0, 0, 1], 0)).expect("listen failed");
@@ -746,36 +700,6 @@ mod tests {
         let addr = mgr.open_stream(slt).expect("stream table full");
         assert!(mgr.send(packet(), &addr).is_ok());
         mgr.close_stream(&addr);
-    }
-
-    #[test]
-    fn test_inline_send_completes_without_the_ring() {
-        let (mgr, slt, mut client) = accepted_with(true);
-        let addr = mgr.open_stream(slt).expect("stream table full");
-        let mut cx = std::task::Context::from_waker(Waker::noop());
-        let Poll::Ready((res, _buf)) = std::pin::pin!(staged_put(&mgr, &addr)).poll(&mut cx) else {
-            panic!("inline put still pending");
-        };
-        assert_eq!(res.unwrap(), 4);
-        assert!(mgr.send(packet(), &addr).is_ok());
-        assert!(!mgr.stream_busy(&addr), "inline send keeps its buffer");
-        let stats = mgr.take_send_stats();
-        assert_eq!((stats.staged, stats.inline, stats.sendmsgs), (2, 2, 0));
-        read_exact(&mut client, 8);
-    }
-
-    #[test]
-    fn test_inline_send_error_fails_the_session() {
-        let (mgr, slt, _client) = accepted_with(true);
-        let addr = mgr.open_stream(slt).expect("stream table full");
-        let fd = mgr.access(|ctx| ctx.socks.index(slt.slot()).unwrap().raw_fd());
-        assert_eq!(unsafe { libc::shutdown(fd, libc::SHUT_WR) }, 0);
-        assert!(mgr.send(packet(), &addr).is_ok(), "the error arrives as a stream end");
-        assert!(!mgr.stream_busy(&addr), "failed inline send keeps its buffer");
-        assert_eq!(mgr.session_health(slt), Some(SessionHealth::Failed(-libc::EPIPE)));
-        drive(&mgr, || ends(&mgr).len() == 1);
-        mgr.close_stream(&addr);
-        assert!(sessions(&mgr).is_empty());
     }
 
     #[test]
