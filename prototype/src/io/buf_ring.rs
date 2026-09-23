@@ -251,6 +251,7 @@ mod tests {
         let mut ring = BufRing::new(7, 8).unwrap();
         assert_eq!(ring.promote(usize::MAX), 8);
         assert_eq!(ring.promote(1), 0);
+        ring.flush();
         for bid in 0..8u16 {
             ring.release(BufId(bid));
         }
@@ -258,6 +259,7 @@ mod tests {
         assert_eq!(shared_tail(&ring), 16);
         assert_eq!(entry(&ring, 5).bid(), 5);
         ring.tail = u16::MAX;
+        ring.published = u16::MAX;
         ring.release(BufId(2));
         ring.flush();
         assert_eq!(shared_tail(&ring), 0);
