@@ -40,7 +40,7 @@ variable "aws_region" {
 variable "aws_az_suffixes" {
   description = "AWS availability zone suffixes to use for the instances"
   type = list(string)
-  default = ["a", "b", "c"]
+  default = ["c"]
 }
 
 ## instance type depends on architecture
@@ -65,7 +65,7 @@ variable "aws_instances" {
     // "x86" = "m6id.xlarge" // 0
 
     // "x86" = "c6id.32xlarge"
-    "x86" = "c6id.metal"
+    "x86" = "c6in.2xlarge"
     "arm" = "c7gd.metal"
     //"x86" = "c6in.xlarge"
     //"arm" = "c7gn.xlarge"
@@ -83,7 +83,7 @@ variable "aws_primary_instances" {
 
     // "x86" = "c6in.32xlarge"
     // "x86" = "c6id.metal"
-    "x86" = "c6in.metal"
+    "x86" = "c6in.2xlarge"
     "arm" = "c6gn.metal"
     // "arm" = "c6gd.xlarge"
   }

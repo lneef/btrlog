@@ -1,0 +1,14 @@
+familiarize yourself with the implementation and especially it cmdline params. Run the service with
+  four nodes on aws (verify all of them are in eu-central-1 c). Run the udp networking backend with
+  
+./v2_bench --journal-threads 8 --primary-thread-count 3 --initial-log-count 4 \
+    --op-count $((500*1000*1000)) --track-percentiles \
+    --min-message-size 128 --max-message-size 128 --zipf-factor 0.0001 \
+    --wal-flush-interval-us 0 --log-creation-interval-ms 500 --print-interval-ms 1000 \
+    --max-log-push-interval-ms 2 --thread-placement unpinned --io-mode manual-poll --wal mock
+
+
+them implement a fragment len on the packet header, parse the the fragments into separate iobufs and
+  keep a leftover/partial segment per socket if udp also for receiving partial datagrams(if this is not
+  a problem ignore it or if possible set an option to disable it). Return the actual messages to
+  application
