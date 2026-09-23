@@ -422,6 +422,7 @@ impl Drop for UringContext {
         while let Some(ev) = self.session_done.pop_front() {
             Self::discard(&mut self.buf_ring, ev.kind, ev.cqe);
         }
+        self.buf_ring.flush();
         if let Err(e) = self.buf_ring.unregister(&self.ring.submitter()) {
             log::error!("unregistering buf ring failed: {}", e);
         }
@@ -1126,6 +1127,7 @@ impl UringContext {
         }
     }
 
+    /// Drops what `cqe` handed over. A recv buffer is released unpublished; the caller flushes.
     fn discard(buf_ring: &mut BufRing, kind: SessionOp, cqe: RawCqe) {
         match kind {
             SessionOp::Accept { .. } => {
@@ -1136,7 +1138,6 @@ impl UringContext {
             SessionOp::Recv { .. } => {
                 if let Some(bid) = cqueue::buffer_select(cqe.flags) {
                     buf_ring.release(BufId(bid));
-                    buf_ring.flush();
                 }
             }
             SessionOp::Send { .. } => {}
@@ -1185,7 +1186,6 @@ impl UringContext {
                     on_recv(slot, data);
                     if let Some(bid) = bid {
                         self.buf_ring.release(bid);
-                        self.buf_ring.flush();
                     }
                 }
                 SessionOp::Send { slot, .. } => on_sent(
@@ -1198,6 +1198,8 @@ impl UringContext {
                 ),
             }
         }
+        // one doorbell for every buffer released above, before the next enter
+        self.buf_ring.flush();
         drained
     }
 }
@@ -2606,5 +2608,61 @@ mod multishot_tests {
             io.sleep(Duration::from_millis(1)).await.unwrap();
         }
         assert_eq!(table.borrow().data[2].1, b"still open");
+    }
+
+    const CQE_F_BUFFER: u32 = 1;
+    const CQE_BUFFER_SHIFT: u32 = 16;
+
+    /// Queues a harvested recv completion for `slot`.
+    fn push_recv(io: &ThreadUring, slot: IndexSlotId, result: i32, bid: Option<u16>) {
+        let flags = bid.map_or(0, |bid| CQE_F_BUFFER | (bid as u32) << CQE_BUFFER_SHIFT);
+        io.access(|ctx| {
+            ctx.session_done.push_back(SessionEvent {
+                kind: SessionOp::Recv { fd: -1, slot },
+                cqe: RawCqe { result, flags },
+            })
+        });
+    }
+
+    fn publishes(io: &ThreadUring) -> (usize, u16) {
+        io.access(|ctx| (ctx.buf_ring.publishes(), ctx.buf_ring.shared_tail()))
+    }
+
+    fn drain_recvs(io: &ThreadUring) -> usize {
+        let mut received = 0;
+        io.drain_sessions(
+            |_| panic!("unexpected accept"),
+            |_, _| received += 1,
+            |_, _| panic!("unexpected send"),
+        );
+        received
+    }
+
+    #[test]
+    fn test_drain_publishes_released_buffers_once() {
+        assert_eq!(cqueue::buffer_select(CQE_F_BUFFER | 5 << CQE_BUFFER_SHIFT), Some(5));
+        let io = small_ring(8);
+        let mut sessions = IndexableSlotStorage::<()>::new(1);
+        let slot = sessions.get().expect("session slot");
+        let (before, tail) = publishes(&io);
+        assert_eq!(tail, 8, "every buffer published at setup");
+        for bid in 0..3 {
+            push_recv(&io, slot, 4, Some(bid));
+        }
+        assert_eq!(drain_recvs(&io), 3);
+        assert_eq!(publishes(&io), (before + 1, 11), "one doorbell for three buffers");
+    }
+
+    #[test]
+    fn test_drain_without_released_buffers_publishes_nothing() {
+        let io = small_ring(8);
+        let mut sessions = IndexableSlotStorage::<()>::new(1);
+        let slot = sessions.get().expect("session slot");
+        let before = publishes(&io);
+        assert_eq!(drain_recvs(&io), 0);
+        push_recv(&io, slot, 0, None);
+        push_recv(&io, slot, -libc::ECONNRESET, None);
+        assert_eq!(drain_recvs(&io), 2);
+        assert_eq!(publishes(&io), before, "tail stored without a released buffer");
     }
 }

@@ -30,6 +30,10 @@ pub struct BufRing {
     storage_offset: usize,
     entries: u16,
     tail: u16,
+    /// tail last stored to the shared ring
+    published: u16,
+    #[cfg(test)]
+    publishes: usize,
     bgid: u16,
     registered: bool,
     pool: Vec<u16>,
@@ -53,6 +57,9 @@ impl BufRing {
             storage_offset,
             entries,
             tail: 0,
+            published: 0,
+            #[cfg(test)]
+            publishes: 0,
             bgid,
             registered: false,
             pool: (0..entries).rev().collect(),
@@ -89,11 +96,19 @@ impl BufRing {
         self.push_entry(bid.0);
     }
 
-    /// Publishes all pending entries to the kernel.
+    /// Publishes all pending entries to the kernel. No-op without pending entries.
     pub fn flush(&mut self) {
+        if self.tail == self.published {
+            return;
+        }
         // SAFETY: ring_ptr() is the initialized page-aligned ring base
         let tail = unsafe { AtomicU16::from_ptr(BufRingEntry::tail(self.ring_ptr()) as *mut u16) };
         tail.store(self.tail, Ordering::Release);
+        self.published = self.tail;
+        #[cfg(test)]
+        {
+            self.publishes += 1;
+        }
     }
 
     /// Buffer handed over by `cqe`, independent of the result value.
@@ -127,7 +142,23 @@ impl BufRing {
         self.pool.len()
     }
 
+    #[cfg(test)]
+    pub fn publishes(&self) -> usize {
+        self.publishes
+    }
+
+    /// Tail as the kernel sees it.
+    #[cfg(test)]
+    pub fn shared_tail(&self) -> u16 {
+        // SAFETY: ring_ptr() is the initialized page-aligned ring base
+        unsafe { AtomicU16::from_ptr(BufRingEntry::tail(self.ring_ptr()) as *mut u16) }.load(Ordering::Acquire)
+    }
+
     fn push_entry(&mut self, bid: u16) {
+        assert!(
+            self.tail.wrapping_sub(self.published) < self.entries,
+            "unpublished entries overrun the ring"
+        );
         let idx = (self.tail & (self.entries - 1)) as usize;
         let addr = self.buf_ptr(bid) as u64;
         // SAFETY: idx < entries, ring memory is owned by self
@@ -231,6 +262,31 @@ mod tests {
         ring.flush();
         assert_eq!(shared_tail(&ring), 0);
         assert_eq!(entry(&ring, 7).bid(), 2);
+    }
+
+    #[test]
+    fn test_flush_without_pending_entries_publishes_nothing() {
+        let mut ring = BufRing::new(7, 8).unwrap();
+        ring.promote(3);
+        ring.flush();
+        assert_eq!(ring.publishes, 1);
+        ring.flush();
+        assert_eq!(ring.publishes, 1, "flush without pending entries stores the tail");
+        ring.release(BufId(0));
+        ring.release(BufId(1));
+        ring.flush();
+        assert_eq!((ring.publishes, shared_tail(&ring)), (2, 5));
+    }
+
+    #[test]
+    #[should_panic(expected = "unpublished entries overrun the ring")]
+    fn test_release_past_a_full_batch_panics() {
+        let mut ring = BufRing::new(7, 8).unwrap();
+        ring.promote(usize::MAX);
+        ring.flush();
+        for bid in 0..9u16 {
+            ring.release(BufId(bid % 8));
+        }
     }
 
     #[test]
