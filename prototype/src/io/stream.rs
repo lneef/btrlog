@@ -5,8 +5,6 @@ use std::task::Poll;
 use std::task::Waker;
 use std::{io, vec};
 
-use self::StreamState::Kernel;
-
 use super::buffer::IoBuf;
 use super::framing::{MessageFramer, StreamConsumer};
 use super::session::{SessionAddr, SessionId};
@@ -15,13 +13,6 @@ use crate::types::packet::PacketHeader;
 
 const STREAM_COUNT: usize = SMALL_SLOT_CAPACITY;
 pub const STREAM_CLOSED: i32 = -libc::ECONNRESET;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum StreamState {
-    Idle,
-    Queued,
-    Kernel,
-}
 
 #[derive(Default)]
 struct StreamContext {
@@ -285,7 +276,6 @@ pub struct StreamManager {
     slots: Rc<StreamSlotStore>,
     head: usize,
     msghdr: libc::msghdr,
-    state: StreamState,
     client: bool,
     framer: MessageFramer,
 }
@@ -298,14 +288,14 @@ impl StreamManager {
             slots: Rc::new(StreamSlotStore::new()),
             head: 0,
             msghdr: unsafe { std::mem::zeroed() },
-            state: StreamState::Idle,
             client,
             framer: MessageFramer::new(),
         }
     }
 
-    pub fn state(&self) -> StreamState {
-        self.state
+    /// Sends waiting in the iovec ring, including those the kernel holds.
+    pub fn staged(&self) -> usize {
+        self.head
     }
 
     const fn empty_iovec() -> libc::iovec {
@@ -316,7 +306,7 @@ impl StreamManager {
     }
 
     pub fn ref_cnt(&self) -> usize {
-        self.slots.open_streams() + (self.state == Kernel) as usize
+        self.slots.open_streams()
     }
 
     pub fn open_stream(&mut self) -> Option<StreamId> {
@@ -369,18 +359,17 @@ impl StreamManager {
         &mut self,
         buf: IoBuf,
         idx: StreamId,
-    ) -> Result<(StreamSendFuture, bool), IoBuf> {
-        let queue = self.stage_inner(buf, idx, false)?;
-        Ok((StreamSendFuture::new(idx, self.slots.clone()), queue))
+    ) -> Result<StreamSendFuture, IoBuf> {
+        self.stage_inner(buf, idx, false)?;
+        Ok(StreamSendFuture::new(idx, self.slots.clone()))
     }
 
     /// Stages a send no future waits for. Its buffer is dropped once the send ends.
-    pub(crate) fn stage_detached(&mut self, buf: IoBuf, idx: StreamId) -> Result<bool, IoBuf> {
+    pub(crate) fn stage_detached(&mut self, buf: IoBuf, idx: StreamId) -> Result<(), IoBuf> {
         self.stage_inner(buf, idx, true)
     }
 
-    /// True when the manager went from idle to queued.
-    fn stage_inner(&mut self, buf: IoBuf, idx: StreamId, detached: bool) -> Result<bool, IoBuf> {
+    fn stage_inner(&mut self, buf: IoBuf, idx: StreamId, detached: bool) -> Result<(), IoBuf> {
         assert!(self.head < STREAM_COUNT, "iovec ring is full");
         assert!(buf.used_bytes() > 0, "staging an empty send");
 
@@ -402,33 +391,20 @@ impl StreamManager {
         self.stream_order[self.head] = idx;
         self.iovec[self.head] = iovec_item;
         self.head += 1;
-
-        let queue = self.state == StreamState::Idle;
-        if queue {
-            self.state = StreamState::Queued;
-        }
-        Ok(queue)
+        Ok(())
     }
 
+    /// Hands every staged send to one sendmsg.
     pub fn prepare(&mut self) -> *const libc::msghdr {
-        assert!(
-            self.state == StreamState::Queued && self.head > 0,
-            "prepare without a queued send"
-        );
+        assert!(self.head > 0, "prepare without a staged send");
         self.msghdr.msg_iov = self.iovec.as_mut_ptr();
         self.msghdr.msg_iovlen = self.head;
-        self.state = StreamState::Kernel;
         &self.msghdr
     }
 
-    /// Fails every staged send the kernel does not hold.
+    /// Fails every staged send. The caller guarantees the kernel holds none of them.
     pub fn fail_queued(&mut self, err: i32) {
         assert!(err < 0, "errors are stored as -errno");
-        assert_ne!(
-            self.state,
-            StreamState::Kernel,
-            "failing sends the kernel still reads"
-        );
         for &idx in &self.stream_order[..self.head] {
             let waker = {
                 let slot = self
@@ -444,19 +420,14 @@ impl StreamManager {
             }
         }
         self.head = 0;
-        self.state = StreamState::Idle;
     }
 
-    /// Ends the send in flight. True when sends are left to submit.
-    pub fn reap(&mut self, res: Result<usize, i32>) -> bool {
-        assert_eq!(self.state, StreamState::Kernel);
+    /// Ends the sendmsg in flight. A failed one fails every staged send.
+    pub fn reap(&mut self, res: Result<usize, i32>) {
+        assert!(self.head > 0, "send completion without a staged send");
         let mut sent = match res {
             Ok(sent) => sent,
-            Err(err) => {
-                self.state = StreamState::Queued;
-                self.fail_queued(err);
-                return false;
-            }
+            Err(err) => return self.fail_queued(err),
         };
         assert!(sent > 0, "send completed without transferring anything");
         let mut last = 0usize;
@@ -481,12 +452,6 @@ impl StreamManager {
         self.stream_order.copy_within(last..self.head, 0);
         self.iovec.copy_within(last..self.head, 0);
         self.head -= last;
-        self.state = if self.head > 0 {
-            StreamState::Queued
-        } else {
-            StreamState::Idle
-        };
-        self.head > 0
     }
 }
 
@@ -559,11 +524,10 @@ mod tests {
         let mut buf = crate::io::local_packet_buffer_pool().pop();
         buf.mark_used(4);
         let buf = mux.stage(buf, stale).err().expect("staged on a closed stream");
-        let (fut, queue) = mux.stage(buf, id).unwrap();
-        assert!(queue);
+        let fut = mux.stage(buf, id).unwrap();
         mux.prepare();
-        assert!(!mux.reap(Ok(4)));
-        assert_eq!(mux.state(), StreamState::Idle);
+        mux.reap(Ok(4));
+        assert_eq!(mux.staged(), 0);
 
         let mut cx = std::task::Context::from_waker(Waker::noop());
         let Poll::Ready((res, _buf)) = std::pin::pin!(fut).poll(&mut cx) else {
@@ -649,7 +613,7 @@ mod tests {
         let id = mux.open_stream().unwrap();
         let mut buf = crate::io::local_packet_buffer_pool().pop();
         buf.mark_used(4);
-        let (_fut, _) = mux.stage(buf, id).unwrap();
+        let _fut = mux.stage(buf, id).unwrap();
 
         mux.on_end(None, SessionId::default(), &rec);
         assert_eq!(mux.slots.open_streams(), 1, "a staged send lost its stream");
@@ -666,12 +630,11 @@ mod tests {
         let futs = ids.map(|id| {
             let mut buf = crate::io::local_packet_buffer_pool().pop();
             buf.mark_used(4);
-            mux.stage(buf, id).unwrap().0
+            mux.stage(buf, id).unwrap()
         });
         mux.prepare();
-        assert_eq!(mux.ref_cnt(), 3, "two streams and the send in flight");
-        assert!(!mux.reap(Err(-libc::ECONNRESET)));
-        assert_eq!(mux.state(), StreamState::Idle);
+        mux.reap(Err(-libc::ECONNRESET));
+        assert_eq!(mux.staged(), 0);
         assert_eq!(mux.ref_cnt(), 2);
         let mut cx = std::task::Context::from_waker(Waker::noop());
         for fut in futs {

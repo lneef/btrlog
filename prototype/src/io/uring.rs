@@ -1224,13 +1224,13 @@ impl ThreadUring {
     }
 
     /// Submits the sendmsg on the next `enter`; the completion arrives via `on_sent`.
-    pub fn send_stream(&self, sock: &impl AsRawFd, slot: IndexSlotId, msg: *const libc::msghdr) {
+    pub fn send_stream(&self, sock: &impl AsRawFd, slot: IndexSlotId, msg: *const libc::msghdr) -> OpId {
         let kind = SessionOp::Send {
             fd: sock.as_raw_fd(),
             slot,
             msg,
         };
-        self.access(|ctx| ctx.submit_session_op(kind));
+        self.access(|ctx| ctx.submit_session_op(kind))
     }
 
     pub fn poll_completion(

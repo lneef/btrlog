@@ -8,7 +8,7 @@ use std::task::{Poll, Waker};
 use super::ThreadUring;
 use super::buffer::IoBuf;
 use super::slot_storage::{IndexSlotId, IndexableSlotStorage};
-use super::stream::{MessageConsumer, StreamId, StreamManager, StreamSendFuture, StreamState};
+use super::stream::{MessageConsumer, StreamId, StreamManager, StreamSendFuture};
 use super::uring::{IOEnterIntent, OpId};
 
 #[inline]
@@ -47,6 +47,8 @@ pub(crate) struct Session {
     peer: SocketAddr,
     manager: StreamManager,
     health: SessionHealth,
+    /// the sendmsg the kernel holds
+    send: Option<OpId>,
     recv: Option<OpId>,
 }
 
@@ -57,12 +59,13 @@ impl Session {
             peer,
             manager: StreamManager::new(client),
             health: SessionHealth::Healthy,
+            send: None,
             recv: None,
         }
     }
 
     fn ref_cnt(&self) -> usize {
-        self.manager.ref_cnt() + self.recv.is_some() as usize
+        self.manager.ref_cnt() + self.send.is_some() as usize + self.recv.is_some() as usize
     }
 
     fn arm_recv(&mut self, io: &ThreadUring, slot: SessionId) {
@@ -90,12 +93,12 @@ impl Session {
     /// Fails the staged sends of an ended session once the kernel holds none.
     fn settle(&mut self) {
         if let Some(errno) = self.health.errno()
-            && self.manager.state() != StreamState::Kernel
+            && self.send.is_none()
         {
             self.manager.fail_queued(-errno);
         }
         debug_assert!(
-            self.health == SessionHealth::Healthy || self.manager.state() != StreamState::Queued,
+            self.health == SessionHealth::Healthy || self.send.is_some() || self.manager.staged() == 0,
             "staged sends outlive the session"
         );
     }
@@ -117,7 +120,7 @@ impl Session {
         self.manager.close_stream(id);
     }
 
-    /// Submits the send right away when the session was idle.
+    /// Submits the send right away when no sendmsg is in flight.
     fn stage(
         &mut self,
         io: &ThreadUring,
@@ -133,10 +136,8 @@ impl Session {
             return Staged::Busy(buf);
         }
         match self.manager.stage(buf, id) {
-            Ok((fut, submit)) => {
-                if submit {
-                    self.submit(io, slot);
-                }
+            Ok(fut) => {
+                self.submit(io, slot);
                 Staged::Sent(fut)
             }
             Err(buf) => Staged::Failed(libc::EBADF, buf),
@@ -156,36 +157,32 @@ impl Session {
         if self.manager.is_busy(id) {
             return Err((libc::EBUSY, buf));
         }
-        let submit = self
-            .manager
+        self.manager
             .stage_detached(buf, id)
             .map_err(|buf| (libc::EBADF, buf))?;
-        if submit {
-            self.submit(io, slot);
-        }
+        self.submit(io, slot);
         Ok(())
     }
 
+    /// Hands the staged sends to one sendmsg unless one is in flight.
     fn submit(&mut self, io: &ThreadUring, slot: SessionId) {
-        if let Some(msg) = self.prepare() {
-            io.send_stream(&self.fd, slot.slot(), msg);
+        if self.send.is_some() || self.manager.staged() == 0 || self.health != SessionHealth::Healthy {
+            return;
         }
+        let msg = self.manager.prepare();
+        self.send = Some(io.send_stream(&self.fd, slot.slot(), msg));
     }
 
-    /// True when sends are left to submit.
-    fn reap(&mut self, res: io::Result<usize>) -> bool {
+    /// Ends the sendmsg in flight, then submits what was staged meanwhile.
+    fn reap(&mut self, io: &ThreadUring, slot: SessionId, res: io::Result<usize>) {
+        assert!(self.send.take().is_some(), "send completion without a sendmsg in flight");
         let res = res.map_err(|e| -e.raw_os_error().expect("send completion without an errno"));
         if let Err(err) = res {
             self.end(SessionHealth::Failed(err));
         }
-        let again = self.manager.reap(res);
+        self.manager.reap(res);
         self.settle();
-        again && self.health == SessionHealth::Healthy
-    }
-
-    /// None when no send is queued.
-    fn prepare(&mut self) -> Option<*const libc::msghdr> {
-        (self.manager.state() == StreamState::Queued).then(|| self.manager.prepare())
+        self.submit(io, slot);
     }
 
     fn on_recv<C: MessageConsumer>(
@@ -396,9 +393,7 @@ impl<C: MessageConsumer> SessionManager<C> {
             let Some(session) = ctx.socks.index_mut(slt.slot()) else {
                 return;
             };
-            if session.reap(res) {
-                session.submit(&self.io, slt);
-            }
+            session.reap(&self.io, slt, res);
             if session.health() != SessionHealth::Healthy {
                 session.cancel_recv(&self.io);
             }
