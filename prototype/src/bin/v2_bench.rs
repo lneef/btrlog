@@ -678,7 +678,21 @@ async fn primary(bench_cfg: &'static BenchConfig) -> Result<(), anyhow::Error> {
                         }; // XXX sleep on err
                     }
                     lstate.driver.wind_down_recv();
-                    let _ = runtime::future::join_all(tasks).await;
+                    if let Some(sessions) = &lstate.sessions {
+                        // in-flight appends still need their session events
+                        let done = Rc::new(Cell::new(false));
+                        let flag = done.clone();
+                        exec.spawn_task(async move {
+                            let _ = runtime::future::join_all(tasks).await;
+                            flag.set(true);
+                        });
+                        while !done.get() {
+                            exec.tick(10);
+                            sessions.manage().expect("session manage failed");
+                        }
+                    } else {
+                        let _ = runtime::future::join_all(tasks).await;
+                    }
                     stats_task.await;
                 }
             },
