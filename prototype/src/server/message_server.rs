@@ -1,8 +1,8 @@
 use std::{
-    cell::UnsafeCell,
+    cell::{RefCell, UnsafeCell},
     net::SocketAddr,
     os::fd::AsRawFd,
-    rc::Rc,
+    rc::{Rc, Weak},
     time::{Duration, Instant},
 };
 
@@ -12,6 +12,8 @@ use crate::{
         BufferPoolConfig, ThreadBuffers,
         buffer::IoBuf,
         local_buffer_pool,
+        session::{SessionAddr, SessionManager},
+        stream::MessageConsumer,
         uring::{IOEnterIntent, OpId},
         watermark::{PacketConsumer, WatermarkRecv},
     },
@@ -45,6 +47,43 @@ impl Into<JournalResponse> for ServerShutdownResult {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ReplyTarget {
+    Udp(SocketAddr),
+    Stream(SessionAddr),
+}
+
+/// Hands TCP requests to their `MessageServer` and collects ended streams.
+struct ServerSink<JournalStore: JournalMessageReceiver + 'static> {
+    server: Weak<MessageServer<JournalStore>>,
+    ended: Rc<RefCell<Vec<SessionAddr>>>,
+}
+
+impl<JournalStore> MessageConsumer for ServerSink<JournalStore>
+where
+    JournalStore: JournalMessageReceiver + 'static,
+{
+    fn consume(&self, result: i32, addr: SessionAddr, buf: Option<&[u8]>) {
+        let Some(msg) = buf else {
+            assert!(result < 0, "stream end without an error");
+            self.ended.borrow_mut().push(addr);
+            return;
+        };
+        let Some(server) = self.server.upgrade() else {
+            return;
+        };
+        let (pkt, _msgbytes) = match RequestPacket::decode_from(msg) {
+            Ok(pkt) => pkt,
+            Err(decode_err) => {
+                log::error!("Error decoding stream message: {:?}, ignoring.", decode_err);
+                return;
+            }
+        };
+        debug_assert_eq!(_msgbytes, msg.len());
+        server.spawn_request_op(ReplyTarget::Stream(addr), pkt);
+    }
+}
+
 struct MessageServer<JournalStore: JournalMessageReceiver + 'static> {
     cfg: &'static ServerConfig,
     store: Rc<JournalStore>,
@@ -53,6 +92,11 @@ struct MessageServer<JournalStore: JournalMessageReceiver + 'static> {
     request_task_pool: ThreadBuffers,
     others: mesh::Senders<(RequestPacket, SocketAddr)>,
     sock: std::net::UdpSocket,
+    sessions: SessionManager<ServerSink<JournalStore>>,
+    /// streams ended by their session, closed once no put is in flight
+    ended_streams: Rc<RefCell<Vec<SessionAddr>>>,
+    /// in-flight stream puts per stream
+    stream_puts: RefCell<Vec<(SessionAddr, usize)>>,
     port: u16,
     id: usize,
     mesh_stats: UnsafeCell<(usize, usize)>,
@@ -69,6 +113,7 @@ where
     #[allow(dead_code)]
     type RequestContinuation = HeapFuture<RequestHandlerType<JournalStore>>;
     const REQUEST_FUTURE_SIZE: usize = std::mem::size_of::<RequestHandlerType<JournalStore>>();
+    const SESSION_SLOTS: usize = 64;
 
     fn new(
         cfg: &'static ServerConfig,
@@ -84,18 +129,46 @@ where
             Self::REQUEST_FUTURE_SIZE,
             BufferPoolConfig::build_with(|buf_cfg| buf_cfg.prealloc_size = bound * Self::REQUEST_FUTURE_SIZE.next_power_of_two()),
         );
-        Rc::new(Self {
-            cfg,
-            store,
-            exec,
-            request_tasks: UnsafeCell::new(BoundedTaskList::new(bound)),
-            request_task_pool,
-            others,
-            sock,
-            port,
-            id,
-            mesh_stats: UnsafeCell::new((0, 0)),
+        Rc::new_cyclic(|server| {
+            let ended_streams = Rc::new(RefCell::new(Vec::new()));
+            let sink = ServerSink {
+                server: server.clone(),
+                ended: ended_streams.clone(),
+            };
+            let addr = sock.local_addr().expect("error getting local address");
+            let listener = exec.io().tcp_listener(addr).expect("error binding tcp listener");
+            let mut sessions = SessionManager::new(exec.io().clone(), Some(listener), Self::SESSION_SLOTS, sink);
+            sessions.start_accepting();
+            Self {
+                cfg,
+                store,
+                exec,
+                request_tasks: UnsafeCell::new(BoundedTaskList::new(bound)),
+                request_task_pool,
+                others,
+                sock,
+                sessions,
+                ended_streams,
+                stream_puts: RefCell::new(Vec::new()),
+                port,
+                id,
+                mesh_stats: UnsafeCell::new((0, 0)),
+            }
         })
+    }
+
+    /// Handles session events, then closes ended streams without puts in flight.
+    fn manage_sessions(&self) -> usize {
+        let events = self.sessions.manage().expect("session manage failed");
+        let puts = self.stream_puts.borrow();
+        self.ended_streams.borrow_mut().retain(|addr| {
+            let busy = puts.iter().any(|(a, _)| a == addr);
+            if !busy {
+                self.sessions.close_stream(addr);
+            }
+            busy
+        });
+        events
     }
 
     fn take_stats(&self) -> JournalStore::Metrics {
@@ -108,14 +181,15 @@ where
         // let mut loop_timer = MicrosecondMeasurement::new_started();
         while !self.exec.wind_down.get() {
             loop {
+                let sessions = self.manage_sessions();
                 let mut reqlen = self.poll_requests();
                 let genericlen = self.exec.poll_generic_tasks();
                 reqlen += self.poll_requests();
-                let mut progress = reqlen + genericlen;
+                let mut progress = sessions + reqlen + genericlen;
 
                 while let Ok(msg) = mesh.try_recv() {
                     unsafe { &mut *self.mesh_stats.get() }.1 += 1;
-                    self.spawn_request_op(msg.1, msg.0);
+                    self.spawn_request_op(ReplyTarget::Udp(msg.1), msg.0);
                     progress += 1;
                 }
 
@@ -158,7 +232,7 @@ where
             progress += self.poll_requests();
             while let Ok(msg) = mesh.try_recv() {
                 unsafe { &mut *self.mesh_stats.get() }.1 += 1;
-                self.spawn_request_op(msg.1, msg.0);
+                self.spawn_request_op(ReplyTarget::Udp(msg.1), msg.0);
                 progress += 1;
             }
             progress += self.exec.poll_generic_tasks();
@@ -182,11 +256,11 @@ where
     }
 
     #[define_opaque(RequestHandlerType)]
-    fn handle_request_wrapped(self: Rc<Self>, fwd: SocketAddr, pkt: RequestPacket) -> RequestHandlerType<JournalStore> {
+    fn handle_request_wrapped(self: Rc<Self>, fwd: ReplyTarget, pkt: RequestPacket) -> RequestHandlerType<JournalStore> {
         async move { self.handle_request(fwd, pkt).await }
     }
 
-    async fn handle_request(self: Rc<Self>, fwd: SocketAddr, pkt: RequestPacket) -> InternalRuntimeAction {
+    async fn handle_request(self: Rc<Self>, fwd: ReplyTarget, pkt: RequestPacket) -> InternalRuntimeAction {
         let _time_sum = MicrosecondMeasurement::new_started();
         let mut _time_range = _time_sum.clone();
         let tracer = RequestTracer::default();
@@ -194,7 +268,7 @@ where
             Some(id) => id,
             None => {
                 return if std::hint::unlikely(pkt.request == JournalRequest::Shutdown) {
-                    if fwd.port() == 0 {
+                    if matches!(fwd, ReplyTarget::Udp(addr) if addr.port() == 0) {
                         InternalRuntimeAction::Shutdown
                     } else {
                         let res = self.shutdown().await;
@@ -252,6 +326,10 @@ where
             // InternalMessageHandlerAction::DidShutDown(response)
             InternalRuntimeAction::Continue
         } else {
+            let ReplyTarget::Udp(fwd) = fwd else {
+                log::error!("stream request for journal {} owned by thread {}, not {}", id, target_proc, self.id);
+                std::process::abort();
+            };
             // TODO spawn so as to not block next recv?
             log::trace!("Forwarding packet over chan: {} -> {}", self.id, target_proc);
             // XXX clone: expensive logging
@@ -277,7 +355,7 @@ where
         )
     }
 
-    async fn net_send(&self, header: PacketHeader, request: JournalResponse, addr: SocketAddr) {
+    async fn net_send(&self, header: PacketHeader, request: JournalResponse, target: ReplyTarget) {
         let mut outgoing = crate::io::local_packet_buffer_pool().pop();
         let _msgid = header.msg_id;
         let pkt = ResponsePacket { header, request };
@@ -289,6 +367,10 @@ where
             }
         };
         outgoing.mark_used(bytes);
+        let addr = match target {
+            ReplyTarget::Udp(addr) => addr,
+            ReplyTarget::Stream(addr) => return self.stream_send(outgoing, addr).await,
+        };
         // self.exec.io().clone().ff_send_to(self.sock.as_raw_fd(), addr, outgoing).await;
         let (res, _buf) = self.exec.io().send_to(self.sock.as_raw_fd(), addr, outgoing).await;
         match res {
@@ -298,6 +380,31 @@ where
             Err(send_err) => {
                 log::error!("Error while sending response: {:?}", send_err);
             }
+        }
+    }
+
+    async fn stream_send(&self, buf: IoBuf, addr: SessionAddr) {
+        self.track_stream_put(addr, true);
+        let (res, _buf) = self.sessions.put(buf, &addr).await;
+        self.track_stream_put(addr, false);
+        if let Err(send_err) = res {
+            log::error!("Error while sending response on {:?}: {:?}", addr, send_err);
+        }
+    }
+
+    fn track_stream_put(&self, addr: SessionAddr, start: bool) {
+        let mut puts = self.stream_puts.borrow_mut();
+        let pos = puts.iter().position(|(a, _)| *a == addr);
+        match (pos, start) {
+            (Some(pos), true) => puts[pos].1 += 1,
+            (None, true) => puts.push((addr, 1)),
+            (Some(pos), false) => {
+                puts[pos].1 -= 1;
+                if puts[pos].1 == 0 {
+                    puts.swap_remove(pos);
+                }
+            }
+            (None, false) => panic!("untracked stream put on {:?}", addr),
         }
     }
 
@@ -341,7 +448,7 @@ where
         res
     }
 
-    fn spawn_request_op(self: &Rc<Self>, fwd: SocketAddr, pkt: RequestPacket) {
+    fn spawn_request_op(self: &Rc<Self>, fwd: ReplyTarget, pkt: RequestPacket) {
         let reqname = format!("(Request :from {:?} :request {} :id {})", fwd, pkt.request, pkt.header.msg_id);
         let this = self.clone();
         let onheap = allocate_heap_future(&self.request_task_pool, this.handle_request_wrapped(fwd, pkt));
@@ -376,7 +483,7 @@ where
         };
         debug_assert_eq!(_msgbytes, PacketHeader::WIRE_SIZE + pkt.header.fragment_len as usize);
         log::debug!("spawning request for packet {:?} from op id {:?} at {:?}", pkt.header, _opid, Instant::now());
-        self.spawn_request_op(from, pkt);
+        self.spawn_request_op(ReplyTarget::Udp(from), pkt);
     }
 }
 
