@@ -214,7 +214,7 @@ struct ThreadState {
     keep_running: Cell<bool>,
     driver: Rc<JournalQuorumDriver>,
     /// Some with `--tcp-datapath`
-    sessions: Option<SessionManager<ClientSink>>,
+    sessions: Option<Rc<SessionManager<ClientSink>>>,
     session_cache: RefCell<HashMap<SocketAddr, SessionId>>,
 }
 
@@ -230,7 +230,7 @@ async fn create_thread_state(
     let sessions = cfg
         .client
         .tcp_datapath
-        .then(|| SessionManager::new(runtime::rt().io().clone(), None::<OwnedFd>, SESSION_SLOTS, driver.tcp_sink()));
+        .then(|| Rc::new(SessionManager::new(runtime::rt().io().clone(), None::<OwnedFd>, SESSION_SLOTS, driver.tcp_sink())));
     Rc::new(ThreadState {
         cfg,
         global,
