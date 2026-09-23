@@ -272,6 +272,8 @@ impl From<(&IOConfig, usize)> for UringConfig {
             }
             s.allow_parking = cfg.io_wait_threshold > 0;
             s.print_slow_submits = false;
+            s.napi.enabled = cfg.napi_busy_poll_us > 0;
+            s.napi.busy_poll_us = cfg.napi_busy_poll_us;
         })
     }
 }

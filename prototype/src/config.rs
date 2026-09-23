@@ -137,6 +137,10 @@ pub struct IOConfig {
     /// conversely, how many LSNs does the server need to keep around before flushing?
     #[arg(long, env, default_value_t = 128)]
     pub lsn_window: usize,
+
+    /// [io] NAPI busy poll time per ring in microseconds, 0 disables NAPI
+    #[arg(long, env, default_value_t = 0)]
+    pub napi_busy_poll_us: u32,
 }
 
 impl IOConfig {
