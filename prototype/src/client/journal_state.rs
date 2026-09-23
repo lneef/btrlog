@@ -1,6 +1,7 @@
 use std::pin::Pin;
 
 use crate::{
+    io::session::SessionAddr,
     runtime::waker_chain::{WakerChainNode, WakerGuard, WakerList},
     types::{
         error::JournalPushError,
@@ -101,6 +102,7 @@ pub struct JournalClientState {
     optimistic_head: WalPosition,
     last_completed: WalRequestStatus,
     reply_to: ForCluster<u16>,
+    streams: ForCluster<Option<SessionAddr>>,
     lsn_window: u64,
 }
 
@@ -112,6 +114,7 @@ impl JournalClientState {
             committed,
             optimistic_head: committed.optimistic_from_committed(),
             last_completed: WalRequestStatus::Ok,
+            streams: ForCluster::from_elem(None, ports.len()),
             reply_to: ports,
             lsn_window,
         }
@@ -124,6 +127,7 @@ impl JournalClientState {
             committed,
             optimistic_head: committed.optimistic_from_committed(),
             last_completed: WalRequestStatus::Ok,
+            streams: ForCluster::from_elem(None, ports.len()),
             reply_to: ports,
             lsn_window,
         }
@@ -135,6 +139,15 @@ impl JournalClientState {
 
     pub fn reply_to_iter(&self) -> impl Iterator<Item = &u16> {
         self.reply_to.iter()
+    }
+
+    /// Stream per replica, None once the replica is unavailable for this journal.
+    pub fn streams(&self) -> &ForCluster<Option<SessionAddr>> {
+        &self.streams
+    }
+
+    pub fn streams_mut(&mut self) -> &mut ForCluster<Option<SessionAddr>> {
+        &mut self.streams
     }
 
     fn mark_completed(&mut self, status: WalRequestStatus, pos: WalPosition) {

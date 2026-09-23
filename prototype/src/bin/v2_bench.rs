@@ -1,6 +1,8 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
+    os::fd::OwnedFd,
     rc::Rc,
     sync::{
         Arc,
@@ -19,11 +21,12 @@ use v2::{
     client::{
         self, ClusterClientView, ClusterUtils, ForCluster, JournalClientState, WalRequestQueue, WalSlotGuard, client_exec,
         client_rt,
-        quorum::{JournalDriverConfig, JournalQuorumDriver, RetrySpec, RetryStatus, bind_retrying_client},
+        quorum::{ClientSink, JournalDriverConfig, JournalQuorumDriver, RetrySpec, RetryStatus, bind_retrying_client},
         stats::ClientStats,
     },
     config::{ClientConfig, ClientThreadConfig, IOConfig, ServerConfig},
     dst::{RandomDST, dst_sample, random_byte_vec, seed_thread_local_dst_rng},
+    io::session::{SessionHealth, SessionId, SessionManager},
     node::health::ClusterHealth,
     runtime::{self, ExecutorConfig, ThreadRuntime, sync::mpsc::UnboundedSender},
     trace::MetricMap,
@@ -210,6 +213,9 @@ struct ThreadState {
     local_ops: Cell<usize>,
     keep_running: Cell<bool>,
     driver: Rc<JournalQuorumDriver>,
+    /// Some with `--tcp-datapath`
+    sessions: Option<SessionManager<ClientSink>>,
+    session_cache: RefCell<HashMap<SocketAddr, SessionId>>,
 }
 
 async fn create_thread_state(
@@ -220,6 +226,11 @@ async fn create_thread_state(
     myid: usize
 ) -> Rc<ThreadState> {
     let driver = bind_retrying_client((local_ip, 0), cfg.driver_cfg(myid, &global.cluster)).expect("failed to create retrying client");
+    const SESSION_SLOTS: usize = 64;
+    let sessions = cfg
+        .client
+        .tcp_datapath
+        .then(|| SessionManager::new(runtime::rt().io().clone(), None::<OwnedFd>, SESSION_SLOTS, driver.tcp_sink()));
     Rc::new(ThreadState {
         cfg,
         global,
@@ -227,6 +238,8 @@ async fn create_thread_state(
         local_ops: Cell::new(0),
         keep_running: Cell::new(true),
         driver,
+        sessions,
+        session_cache: RefCell::new(HashMap::new()),
     })
 }
 
@@ -334,6 +347,7 @@ impl ThreadState {
         // let retries = retrying_stream.get_executed_retries();
         // stats.record_request(majority_latency, req_size, retries);
         //
+        let answered = replies.iter().map(Option::is_some).collect::<ForCluster<_>>();
         let reply_to = replies
             .into_iter()
             .zip(remotes.into_iter())
@@ -358,7 +372,54 @@ impl ThreadState {
                 e => panic!("unexpected response creating journal: {:?}", e),
             })
             .collect::<ForCluster<_>>();
-        JournalClientState::new_empty(journal_id, reply_to, self.cfg.io.lsn_window as u64)
+        let mut journal = JournalClientState::new_empty(journal_id, reply_to, self.cfg.io.lsn_window as u64);
+        if let Some(sessions) = &self.sessions {
+            self.open_streams(sessions, &mut journal, &answered).await;
+        }
+        journal
+    }
+
+    /// Opens a stream on each answering replica's session, connecting where no healthy one is cached.
+    async fn open_streams(
+        &self,
+        sessions: &SessionManager<ClientSink>,
+        journal: &mut JournalClientState,
+        answered: &ForCluster<bool>,
+    ) {
+        let peers = self
+            .cluster()
+            .iter()
+            .zip(journal.reply_to_iter())
+            .map(|(addr, port)| SocketAddr::from((addr.ip(), *port)))
+            .collect::<ForCluster<_>>();
+        let connects = runtime::future::join_all(peers.iter().zip(answered.iter()).map(|(peer, &answered)| async move {
+            if !answered {
+                return None;
+            }
+            let cached = self.session_cache.borrow().get(peer).copied();
+            if let Some(slt) = cached
+                && sessions.session_health(slt) == Some(SessionHealth::Healthy)
+            {
+                return Some(slt);
+            }
+            match sessions.connect(*peer).await {
+                Ok(slt) => {
+                    self.session_cache.borrow_mut().insert(*peer, slt);
+                    Some(slt)
+                }
+                Err(e) => {
+                    log::warn!("connecting to {} failed: {}", peer, e);
+                    None
+                }
+            }
+        }))
+        .await;
+        for (stream, slt) in journal.streams_mut().iter_mut().zip(connects) {
+            *stream = slt.and_then(|slt| sessions.open_stream(slt));
+        }
+        let available = journal.streams().iter().filter(|s| s.is_some()).count();
+        let majority = self.cfg.entry_retry_spec(self.cluster()).required_majority;
+        assert!(available >= majority, "only {} of {} replica streams open for journal {}", available, majority, journal.id());
     }
 
     async fn push_to_journal(
@@ -368,36 +429,70 @@ impl ThreadState {
         size: usize,
     ) {
         let cluster = self.cluster();
+        let mut tcp_remotes = ForCluster::new();
+        if let Some(sessions) = &self.sessions {
+            self.driver.tcp_streams().take_ended(|addr| match state.streams_mut().iter_mut().find(|s| **s == Some(*addr)) {
+                Some(stream) => {
+                    *stream = None;
+                    sessions.close_stream(addr);
+                    true
+                }
+                None => false,
+            });
+            tcp_remotes.extend(
+                cluster
+                    .iter()
+                    .zip(state.reply_to_iter())
+                    .zip(state.streams())
+                    .map(|((addr, port), stream)| (SocketAddr::from((addr.ip(), *port)), *stream)),
+            );
+        }
         let mut seq_guard = std::pin::pin!(WalSlotGuard::new(state, queue));
         let entry_retry_spec = self.cfg.entry_retry_spec(cluster);
         let payload = random_byte_vec(size); // XXX prevent / reuse with exsiting iobuf
         let wal_position = seq_guard.get_wal_slot(payload.len() as u64).expect("error getting wal slot");
         let entry = seq_guard.make_request(&wal_position, &payload);
-        // broadcast append request with retry logic
-        let (replies, remotes) = self
-            .driver
-            .retrying_quorum_send_recv(
-                JournalRequest::AddEntry(entry.clone()),
-                &entry_retry_spec,
-                cluster
-                    .iter()
-                    .zip(seq_guard.state().reply_to_iter())
-                    .map(|(addr, port)| SocketAddr::from((addr.ip(), *port))),
-                |msg, _from| {
-                    match &msg.request {
-                        &JournalResponse::AddEntry(ref add_resp) => {
-                            match seq_guard.check(&add_resp) {
-                                //
-                                true => RetryStatus::Ok,
-                                false => RetryStatus::Retry,
-                            }
-                        }
-                        x => RetryStatus::Abort(format!("unexpected response to AddEntry: {:?}", x)),
+        let check = |msg: &ResponsePacket, _from: &SocketAddr| {
+            match &msg.request {
+                &JournalResponse::AddEntry(ref add_resp) => {
+                    match seq_guard.check(&add_resp) {
+                        //
+                        true => RetryStatus::Ok,
+                        false => RetryStatus::Retry,
                     }
-                },
-            )
-            .await
-            .expect(format!("error receiving replies for {} - {}", entry.id, entry.lsn).as_str());
+                }
+                x => RetryStatus::Abort(format!("unexpected response to AddEntry: {:?}", x)),
+            }
+        };
+        // broadcast append request with retry logic
+        let (replies, remotes) = match &self.sessions {
+            Some(sessions) => {
+                self.driver
+                    .tcp_quorum_send(
+                        sessions,
+                        JournalRequest::AddEntry(entry.clone()),
+                        &tcp_remotes,
+                        entry_retry_spec.required_majority,
+                        Duration::from_millis(self.cfg.client.tcp_request_timeout_ms),
+                        check,
+                    )
+                    .await
+            }
+            None => {
+                self.driver
+                    .retrying_quorum_send_recv(
+                        JournalRequest::AddEntry(entry.clone()),
+                        &entry_retry_spec,
+                        cluster
+                            .iter()
+                            .zip(seq_guard.state().reply_to_iter())
+                            .map(|(addr, port)| SocketAddr::from((addr.ip(), *port))),
+                        check,
+                    )
+                    .await
+            }
+        }
+        .expect(format!("error receiving replies for {} - {}", entry.id, entry.lsn).as_str());
 
         let mut any_response: Option<&AddEntryResponse> = None;
         for (idx, (resp, addr)) in replies.iter().zip(remotes.into_iter()).enumerate() {
@@ -564,6 +659,9 @@ async fn primary(bench_cfg: &'static BenchConfig) -> Result<(), anyhow::Error> {
                     let exec = client_exec();
                     while lstate.keep_running.get() {
                         exec.tick(10);
+                        if let Some(sessions) = &lstate.sessions {
+                            sessions.manage().expect("session manage failed");
+                        }
                         // exec.check_mailbox();
                         // let mut progress = lstate.driver.poll_recv();
                         // progress += exec.poll_generic_tasks();

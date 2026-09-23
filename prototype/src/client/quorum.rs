@@ -1,6 +1,6 @@
 use std::{
-    cell::UnsafeCell,
-    net::{SocketAddr, UdpSocket},
+    cell::{RefCell, UnsafeCell},
+    net::{IpAddr, SocketAddr, UdpSocket},
     os::fd::AsRawFd,
     rc::Rc,
     time::{Duration, Instant},
@@ -14,6 +14,8 @@ use crate::{
         ThreadBuffers, ThreadUring,
         buffer::IoBuffer,
         local_packet_buffer_pool,
+        session::{SessionAddr, SessionManager},
+        stream::MessageConsumer,
         watermark::{PacketConsumer, WatermarkRecv},
     },
     runtime::{self, stackref::StateTable},
@@ -46,6 +48,8 @@ struct PendingQuorum<Msg> {
     received: ForCluster<Option<Msg>>,
     from: ForCluster<SocketAddr>,
     wake_after_n: isize,
+    failed: ForCluster<bool>,
+    majority: usize,
 }
 
 impl<Msg> PendingQuorum<Msg> {
@@ -56,7 +60,25 @@ impl<Msg> PendingQuorum<Msg> {
             received,
             from: ForCluster::from_iter(expected),
             wake_after_n: majority as isize,
+            failed: ForCluster::from_elem(false, max),
+            majority,
         }
+    }
+
+    /// Fails the replicas at `ip` that have not answered. True once the majority is out of reach.
+    pub(super) fn fail(&mut self, ip: IpAddr) -> bool {
+        let replicas = self.from.iter().zip(self.received.iter()).zip(self.failed.iter_mut());
+        for ((addr, msg), failed) in replicas {
+            if addr.ip() == ip && msg.is_none() {
+                *failed = true;
+            }
+        }
+        self.majority_impossible()
+    }
+
+    pub(super) fn majority_impossible(&self) -> bool {
+        let failed = self.failed.iter().take(self.from.len()).filter(|&&f| f).count();
+        self.from.len() - failed < self.majority
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = (&Option<Msg>, &SocketAddr)> {
@@ -79,6 +101,11 @@ struct GlobalQuorumState {
 }
 
 impl GlobalQuorumState {
+    fn on_replica_failed(&self, msg_id: u64, ip: IpAddr) {
+        let (slot, uid) = ((msg_id >> 32) as u16, msg_id as u32);
+        self.pending.map(slot, uid, |state| state.fail(ip).then_some(()));
+    }
+
     fn new(cap: u16) -> Rc<Self> {
         Rc::new(Self {
             pending: StateTable::new(cap),
@@ -138,9 +165,84 @@ impl PacketConsumer for Rc<GlobalQuorumState> {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+/// Per-thread TCP datapath state shared by the sink and the journal tasks.
+pub struct TcpStreams {
+    /// stream -> (msg_id of its last append, peer)
+    inflight: RefCell<Vec<(SessionAddr, u64, SocketAddr)>>,
+    /// ended streams their journal has not closed yet
+    ended: RefCell<Vec<SessionAddr>>,
+}
+
+impl TcpStreams {
+    fn new(cap: usize) -> Rc<Self> {
+        Rc::new(Self {
+            inflight: RefCell::new(Vec::with_capacity(cap)),
+            ended: RefCell::new(Vec::with_capacity(cap)),
+        })
+    }
+
+    fn peer(&self, addr: &SessionAddr) -> Option<(u64, SocketAddr)> {
+        let inflight = self.inflight.borrow();
+        inflight.iter().find(|(a, ..)| a == addr).map(|&(_, id, peer)| (id, peer))
+    }
+
+    fn set_inflight(&self, addr: SessionAddr, msg_id: u64, peer: SocketAddr) {
+        let mut inflight = self.inflight.borrow_mut();
+        match inflight.iter_mut().find(|(a, ..)| *a == addr) {
+            Some(entry) => *entry = (addr, msg_id, peer),
+            None => inflight.push((addr, msg_id, peer)),
+        }
+    }
+
+    fn clear_inflight(&self, msg_id: u64) {
+        self.inflight.borrow_mut().retain(|&(_, id, _)| id != msg_id);
+    }
+
+    /// Removes the ended streams `owned` claims.
+    pub fn take_ended(&self, mut owned: impl FnMut(&SessionAddr) -> bool) {
+        self.ended.borrow_mut().retain(|addr| !owned(addr));
+    }
+}
+
+pub struct ClientSink {
+    pending: Rc<GlobalQuorumState>,
+    streams: Rc<TcpStreams>,
+}
+
+impl MessageConsumer for ClientSink {
+    fn consume(&self, result: i32, addr: SessionAddr, buf: Option<&[u8]>) {
+        let Some(buf) = buf else {
+            log::debug!("stream {:?} ended with {}", addr, result);
+            if let Some((msg_id, peer)) = self.streams.peer(&addr) {
+                self.pending.on_replica_failed(msg_id, peer.ip());
+            }
+            self.streams.ended.borrow_mut().push(addr);
+            return;
+        };
+        let pkg = match ResponsePacket::decode_from(buf) {
+            Ok((pkg, _bytes)) => pkg,
+            Err(e) => {
+                log::error!("error decoding packet: {:?}", e);
+                return;
+            }
+        };
+        let Some((_, peer)) = self.streams.peer(&addr) else {
+            log::trace!("response on stream {:?} without an append in flight", addr);
+            return;
+        };
+        let (slot, uid) = ((pkg.header.msg_id >> 32) as u16, pkg.header.msg_id as u32);
+        self.pending.on_message_recv(peer, slot, uid, pkg);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
 #[derive(Debug, derive_more::Display, thiserror::Error)]
 pub enum RetryRequestError {
     NoOpenStreams,
+    NoMajority,
+    #[display("(:timeout {_0:?})")]
+    Timeout(Duration),
     LocalIO,
     MessageEncoding,
     #[display("(:timeout {_0:?} :retries {_1} :took {_2:?})")]
@@ -176,6 +278,7 @@ pub struct JournalQuorumDriver {
     pending: Rc<GlobalQuorumState>,
     recv: Rc<WatermarkRecv<Rc<GlobalQuorumState>>>,
     stats: std::cell::UnsafeCell<ClientStats>,
+    tcp: Rc<TcpStreams>,
     cfg: JournalDriverConfig,
     request_trace_buffer: Option<ClientRequestTraceBuffer>
 }
@@ -197,6 +300,7 @@ impl JournalQuorumDriver {
             pending: pending.clone(),
             recv: WatermarkRecv::new(rawsock, io.clone(), cfg.open_reads as u16, pending),
             stats: UnsafeCell::new(ClientStats::new(cfg.track_percentiles)),
+            tcp: TcpStreams::new(cfg.io_depth as usize),
             cfg,
             request_trace_buffer: trace_buffer
         }
@@ -216,6 +320,111 @@ impl JournalQuorumDriver {
 
     pub fn wind_down_recv(&self) {
         self.recv.start_winding_down();
+    }
+
+    pub fn tcp_sink(&self) -> ClientSink {
+        ClientSink {
+            pending: self.pending.clone(),
+            streams: self.tcp.clone(),
+        }
+    }
+
+    pub fn tcp_streams(&self) -> &TcpStreams {
+        &self.tcp
+    }
+
+    /// Sends `req` once on every replica's stream and waits for `majority` valid responses.
+    /// `remotes[i]` is replica i and its stream, None when the replica is unavailable.
+    pub async fn tcp_quorum_send<CheckResponse>(
+        self: &Rc<Self>,
+        sessions: &SessionManager<ClientSink>,
+        req: JournalRequest,
+        remotes: &ForCluster<(SocketAddr, Option<SessionAddr>)>,
+        majority: usize,
+        timeout: Duration,
+        mut check_response: CheckResponse,
+    ) -> Result<(ForCluster<Option<ResponsePacket>>, ForCluster<SocketAddr>), RetryRequestError>
+    where
+        CheckResponse: FnMut(&ResponsePacket, &SocketAddr) -> RetryStatus,
+    {
+        let mut quorum = PendingQuorum::new(remotes.len(), majority, remotes.iter().map(|(addr, _)| *addr));
+        for (addr, stream) in remotes.iter() {
+            if stream.is_none() {
+                quorum.fail(addr.ip());
+            }
+        }
+        if quorum.majority_impossible() {
+            return Err(RetryRequestError::NoMajority);
+        }
+        let mut stream = self.pending.pending.put(&mut quorum).ok_or(RetryRequestError::NoOpenStreams)?;
+        let (slot, uid) = stream.refids();
+        let msg_id = ((slot as u64) << 32) | (uid as u64);
+        let packet = RequestPacket {
+            header: PacketHeader {
+                msg_id,
+                reply_to: self.addr.port(),
+                stream_id: 0,
+                fragment_len: 0,
+            },
+            request: req,
+        };
+        let available = remotes.iter().filter(|(_, stream)| stream.is_some()).count();
+        let mut bufs = Self::encode_many(&self.bufpool, available, |dst| packet.encode_framed(dst))
+            .map_err(|_| RetryRequestError::MessageEncoding)?;
+        let mut sends = ForCluster::with_capacity(available);
+        let mut request_bytes = 0;
+        for (peer, addr) in remotes.iter() {
+            let Some(addr) = addr else {
+                continue;
+            };
+            let buf = bufs.next().expect("a buffer per available replica");
+            request_bytes = buf.used_bytes();
+            let mut header = PacketHeader::peek(buf.as_slice())
+                .expect("encoded request shorter than its header")
+                .expect("encoded request header does not decode");
+            header.stream_id = addr.stream().to_wire();
+            header.encode_into(buf.data_mut()).map_err(|_| RetryRequestError::MessageEncoding)?;
+            self.tcp.set_inflight(*addr, msg_id, *peer);
+            sends.push(async move { (sessions.put(buf, addr).await, *peer) });
+        }
+        let t_start = Instant::now();
+        for ((res, _buf), peer) in runtime::future::join_all(sends).await {
+            if let Err(e) = res {
+                log::warn!("send to {} failed: {}", peer, e);
+                stream.fail(peer.ip());
+            }
+        }
+        let t_recv_start = Instant::now();
+        let quorum_future = stream.wait_for(|state| {
+            let mut valid_count = 0;
+            for (from_idx, (opt_msg, addr)) in state.received.iter().zip(state.from.iter()).enumerate() {
+                let Some(msg) = opt_msg else {
+                    continue;
+                };
+                match check_response(msg, addr) {
+                    RetryStatus::Ok => valid_count += 1,
+                    RetryStatus::Retry => state.failed[from_idx] = true,
+                    RetryStatus::Abort(msg) => return Some(Err(RetryRequestError::Aborted(msg))),
+                }
+            }
+            if valid_count >= majority {
+                Some(Ok(()))
+            } else if state.majority_impossible() {
+                Some(Err(RetryRequestError::NoMajority))
+            } else {
+                None
+            }
+        });
+        let rt = crate::client::client_exec();
+        let res = runtime::select! {
+            _ = rt.sleep(timeout) => Err(RetryRequestError::Timeout(timeout)),
+            res = quorum_future => res,
+        };
+        std::mem::drop(stream);
+        self.tcp.clear_inflight(msg_id);
+        res?;
+        self.trace(|s| s.record_request(t_recv_start.elapsed(), t_recv_start.duration_since(t_start), request_bytes, 0));
+        Ok((quorum.received, quorum.from))
     }
 
     // XXX put these futures into their own queue, separate from
@@ -432,6 +641,21 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn test_failures_decide_the_majority() {
+        let replicas: [SocketAddr; 3] = [([127, 0, 0, 1], 1).into(), ([127, 0, 1, 1], 1).into(), ([127, 0, 2, 1], 1).into()];
+        let mut quorum = PendingQuorum::<()>::new(3, 2, replicas);
+        assert!(!quorum.fail(replicas[0].ip()), "two replicas left for a majority of two");
+        assert!(quorum.fail(replicas[1].ip()), "one replica left for a majority of two");
+
+        let mut quorum = PendingQuorum::<()>::new(3, 2, replicas);
+        quorum.received[1] = Some(());
+        quorum.received[2] = Some(());
+        assert!(!quorum.fail(replicas[0].ip()));
+        assert!(!quorum.fail(replicas[1].ip()), "an answered replica cannot fail");
+        assert!(!quorum.majority_impossible());
+    }
 
     #[test]
     fn test_encode_many() {

@@ -294,6 +294,14 @@ pub struct ClientConfig {
     #[clap(long, env, default_value_t = 1000)]
     pub internal_receive_op_timeout: u64,
 
+    /// [client] Send appends over the TCP session layer instead of UDP
+    #[clap(long, env, default_value_t = false)]
+    pub tcp_datapath: bool,
+
+    /// [client] Timeout for a TCP append to reach its majority
+    #[clap(long, env, default_value_t = 1000)]
+    pub tcp_request_timeout_ms: u64,
+
     /// [client] Start a REPL on the primary node for interactive debugging
     #[clap(long, env, value_enum, default_value_t = ReplMode::None)]
     pub repl: ReplMode,
