@@ -453,7 +453,14 @@ impl<C: MessageConsumer> SessionManager<C> {
     }
 
     fn accept(&self, fd: OwnedFd) {
-        let peer = match socket2::SockRef::from(&fd).peer_addr().map(|a| a.as_socket()) {
+        let sock = socket2::SockRef::from(&fd);
+        if let Err(e) = sock.set_tcp_nodelay(true) {
+            log::warn!("TCP_NODELAY on an accepted connection failed: {}", e);
+        }
+        if let Err(e) = sock.set_tcp_congestion(b"bbr") {
+            log::debug!("bbr unavailable, keeping the default congestion control: {}", e);
+        }
+        let peer = match sock.peer_addr().map(|a| a.as_socket()) {
             Ok(Some(peer)) => peer,
             Ok(None) | Err(_) => {
                 log::warn!("accepted a connection without a peer address, dropping it");
