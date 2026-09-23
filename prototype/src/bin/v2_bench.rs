@@ -658,10 +658,15 @@ async fn primary(bench_cfg: &'static BenchConfig) -> Result<(), anyhow::Error> {
                         tasks.push(lstate.clone().spawn_journal_task());
                     }
                     let exec = client_exec();
+                    let mut last_stats = Instant::now();
                     while lstate.keep_running.get() {
                         exec.tick(10);
                         if let Some(sessions) = &lstate.sessions {
                             sessions.manage().expect("session manage failed");
+                            if last_stats.elapsed() >= Duration::from_secs(1) {
+                                last_stats = Instant::now();
+                                sessions.take_send_stats().print("client", tid);
+                            }
                         }
                         // exec.check_mailbox();
                         // let mut progress = lstate.driver.poll_recv();

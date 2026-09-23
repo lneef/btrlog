@@ -179,9 +179,17 @@ where
         let recv = Rc::new(WatermarkRecv::new(self.sock.as_raw_fd(), self.exec.io().clone(), 32 as u16, self));
         // let (mut long_loops, mut loops) = (0, 0);
         // let mut loop_timer = MicrosecondMeasurement::new_started();
+        let mut last_stats = Instant::now();
         while !self.exec.wind_down.get() {
             loop {
                 let sessions = self.manage_sessions();
+                if last_stats.elapsed() >= Duration::from_secs(1) {
+                    last_stats = Instant::now();
+                    let stats = self.sessions.take_send_stats();
+                    if stats.staged > 0 {
+                        stats.print("server", self.id);
+                    }
+                }
                 let mut reqlen = self.poll_requests();
                 let genericlen = self.exec.poll_generic_tasks();
                 reqlen += self.poll_requests();

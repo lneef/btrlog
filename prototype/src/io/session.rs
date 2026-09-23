@@ -35,6 +35,17 @@ impl SessionHealth {
     }
 }
 
+/// Send counters of one `SessionManager` since the last `take_send_stats`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SendStats {
+    /// messages staged for a send
+    pub staged: u64,
+    /// messages staged while their session had a sendmsg in flight
+    pub behind: u64,
+    /// completed sendmsgs
+    pub sendmsgs: u64,
+}
+
 enum Staged {
     Sent(StreamSendFuture),
     /// The stream still holds a staged send.
@@ -215,6 +226,7 @@ impl Session {
 pub(crate) struct SessionManagerContext {
     pub(crate) socks: IndexableSlotStorage<Session>,
     accepted: Vec<SessionId>,
+    stats: SendStats,
 }
 
 impl SessionManagerContext {
@@ -271,6 +283,19 @@ impl SessionAddr {
     }
 }
 
+impl SendStats {
+    /// Prints the counters as one stderr line.
+    pub fn print(&self, role: &str, id: usize) {
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        eprintln!(
+            "send-stats role={} id={} unix_ms={} staged={} behind={} sendmsgs={}",
+            role, id, unix_ms, self.staged, self.behind, self.sendmsgs
+        );
+    }
+}
+
 impl<C: MessageConsumer> SessionManager<C> {
     pub fn new(
         io: ThreadUring,
@@ -283,6 +308,7 @@ impl<C: MessageConsumer> SessionManager<C> {
         let ctx = SessionManagerContext {
             socks: IndexableSlotStorage::new(slots),
             accepted: Vec::with_capacity(slots),
+            stats: SendStats::default(),
         };
         Self {
             io,
@@ -350,8 +376,13 @@ impl<C: MessageConsumer> SessionManager<C> {
                 let Some(session) = ctx.socks.index_mut(addr.session.slot()) else {
                     return Poll::Ready(Err((libc::EBADF, taken)));
                 };
+                let behind = session.send.is_some();
                 match session.stage(&self.io, addr.session, taken, addr.stream, cx.waker()) {
-                    Staged::Sent(fut) => Poll::Ready(Ok(fut)),
+                    Staged::Sent(fut) => {
+                        ctx.stats.staged += 1;
+                        ctx.stats.behind += behind as u64;
+                        Poll::Ready(Ok(fut))
+                    }
                     Staged::Failed(errno, buf) => Poll::Ready(Err((errno, buf))),
                     Staged::Busy(back) => {
                         buf = Some(back);
@@ -374,12 +405,20 @@ impl<C: MessageConsumer> SessionManager<C> {
             let Some(session) = ctx.socks.index_mut(addr.session.slot()) else {
                 return Err((libc::EBADF, buf));
             };
-            session.send_detached(&self.io, addr.session, buf, addr.stream)
+            let behind = session.send.is_some();
+            session.send_detached(&self.io, addr.session, buf, addr.stream)?;
+            ctx.stats.staged += 1;
+            ctx.stats.behind += behind as u64;
+            Ok(())
         })
         .map_err(|(errno, buf)| (io::Error::from_raw_os_error(errno), buf))
     }
 
     /// True while the stream holds a staged send.
+    pub fn take_send_stats(&self) -> SendStats {
+        self.access(|ctx| std::mem::take(&mut ctx.stats))
+    }
+
     pub fn stream_busy(&self, addr: &SessionAddr) -> bool {
         self.access(|ctx| {
             ctx.socks
@@ -394,6 +433,7 @@ impl<C: MessageConsumer> SessionManager<C> {
                 return;
             };
             session.reap(&self.io, slt, res);
+            ctx.stats.sendmsgs += 1;
             if session.health() != SessionHealth::Healthy {
                 session.cancel_recv(&self.io);
             }
