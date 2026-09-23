@@ -137,6 +137,21 @@ pub struct IOConfig {
     /// conversely, how many LSNs does the server need to keep around before flushing?
     #[arg(long, env, default_value_t = 128)]
     pub lsn_window: usize,
+
+    /// [io] enable UDP receive offload (UDP_GRO) on journal sockets; the kernel may
+    /// then coalesce datagrams, which are split into messages before delivery
+    #[arg(long, env, default_value_t = false)]
+    pub udp_gro: bool,
+
+    /// [io] queue UDP sends per destination and flush them once per event loop
+    /// iteration, sending runs of equal-sized messages with one UDP GSO (UDP_SEGMENT) sendmsg
+    #[arg(long, env, default_value_t = false)]
+    pub udp_gso: bool,
+
+    /// [io] with --udp-gso/--udp-gro: print per-thread offload counters to stderr
+    /// every N ms (0: only once at shutdown)
+    #[arg(long, env, default_value_t = 0)]
+    pub udp_offload_stats_ms: u64,
 }
 
 impl IOConfig {

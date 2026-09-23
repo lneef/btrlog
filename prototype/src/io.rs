@@ -1,5 +1,7 @@
 pub mod buffer;
 pub mod send_buffer;
+pub mod udp_offload;
+pub mod udp_send_queue;
 pub mod uring;
 pub mod watermark;
 

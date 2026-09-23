@@ -109,7 +109,10 @@ impl BenchConfig {
             io_depth: (self.io.io_depth / 4) as u16, // XXX should limit the no of tasks per thread spawned
             open_reads: (cluster.node_count() * 2) as u16, // XXX
             track_percentiles: self.track_percentiles,
-            request_sample_rate: (if cfg!(feature = "trace-requests") && tid == 1 { self.sample_frequency } else { 0 }) as u32
+            request_sample_rate: (if cfg!(feature = "trace-requests") && tid == 1 { self.sample_frequency } else { 0 }) as u32,
+            udp_gro: self.io.udp_gro,
+            udp_gso: self.io.udp_gso,
+            udp_offload_stats_ms: self.io.udp_offload_stats_ms,
         }
     }
 

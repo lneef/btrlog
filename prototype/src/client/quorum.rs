@@ -14,12 +14,14 @@ use crate::{
         ThreadBuffers, ThreadUring,
         buffer::IoBuffer,
         local_packet_buffer_pool,
-        watermark::{PacketConsumer, WatermarkRecv},
+        udp_offload::{enable_offload_stats, print_offload_stats},
+        udp_send_queue::UdpSendQueue,
+        watermark::{PacketConsumer, RecvOptions, WatermarkRecv},
     },
     runtime::{self, stackref::StateTable},
     types::{
         message::JournalRequest,
-        packet::{PacketHeader, RequestPacket, ResponsePacket},
+        packet::{FramedPacket, PacketHeader, RequestPacket, ResponsePacket},
         wire::WireMessage,
     },
 };
@@ -114,12 +116,16 @@ impl GlobalQuorumState {
 }
 
 impl PacketConsumer for Rc<GlobalQuorumState> {
-    fn consume_raw(&self, result: i32, from: SocketAddr, buf: crate::io::buffer::IoBuf, _id: crate::io::uring::OpId) {
+    fn consume_raw(&self, result: i32, from: SocketAddr, buf: crate::io::buffer::IoBuf, id: crate::io::uring::OpId) {
         if result <= 0 {
             log::error!("error while receiving journal response: {}", result);
             return;
         }
-        let (pkg, _bytes) = match ResponsePacket::decode_from(buf.as_slice()) {
+        self.consume_datagram(from, buf.as_slice(), id);
+    }
+
+    fn consume_datagram(&self, from: SocketAddr, bytes: &[u8], _id: crate::io::uring::OpId) {
+        let (pkg, _bytes) = match ResponsePacket::decode_from(bytes) {
             Ok((pkg, bytes)) => (pkg, bytes),
             Err(_e) => {
                 log::error!("error decoding packet: {:?}", _e);
@@ -161,7 +167,13 @@ pub struct JournalDriverConfig {
     pub io_depth: u16,
     pub open_reads: u16,
     pub track_percentiles: bool,
-    pub request_sample_rate: u32
+    pub request_sample_rate: u32,
+    /// enable UDP_GRO on the response socket
+    pub udp_gro: bool,
+    /// queue sends and coalesce them with UDP GSO
+    pub udp_gso: bool,
+    /// print offload counters every N ms (0: only when winding down)
+    pub udp_offload_stats_ms: u64,
 }
 impl JournalDriverConfig {
     crate::util::integrated_builder!();
@@ -171,6 +183,7 @@ pub struct JournalQuorumDriver {
     sock: UdpSocket,
     addr: SocketAddr,
     io: ThreadUring,
+    send_queue: Option<Rc<UdpSendQueue>>,
     bufpool: ThreadBuffers,
     pending: Rc<GlobalQuorumState>,
     recv: Rc<WatermarkRecv<Rc<GlobalQuorumState>>>,
@@ -184,17 +197,26 @@ impl JournalQuorumDriver {
         let rawsock = sock.as_raw_fd();
         let pending = GlobalQuorumState::new(cfg.io_depth as u16);
         let addr = sock.local_addr().expect("error getting local address of udp port");
+        let recv_opts = RecvOptions {
+            framing: PacketHeader::FRAMING,
+            gro: cfg.udp_gro,
+        };
         let trace_buffer = match cfg.request_sample_rate {
             0 => None,
             _n => Some(ClientRequestTraceBuffer::new())
         };
+        if cfg.udp_gro || cfg.udp_gso {
+            enable_offload_stats(cfg.udp_offload_stats_ms);
+        }
+        let send_queue = cfg.udp_gso.then(|| UdpSendQueue::new(rawsock, &io, true));
         Self {
             sock,
             addr,
             io: io.clone(),
+            send_queue,
             bufpool: local_packet_buffer_pool(),
             pending: pending.clone(),
-            recv: WatermarkRecv::new(rawsock, io.clone(), cfg.open_reads as u16, pending),
+            recv: WatermarkRecv::with_options(rawsock, io.clone(), cfg.open_reads as u16, recv_opts, pending),
             stats: UnsafeCell::new(ClientStats::new(cfg.track_percentiles)),
             cfg,
             request_trace_buffer: trace_buffer
@@ -215,6 +237,14 @@ impl JournalQuorumDriver {
 
     pub fn wind_down_recv(&self) {
         self.recv.start_winding_down();
+        print_offload_stats("client");
+    }
+
+    async fn send_to(&self, to: SocketAddr, buf: IoBuffer) -> (std::io::Result<usize>, IoBuffer) {
+        match &self.send_queue {
+            Some(queue) => queue.send_to(to, buf).await,
+            None => self.io.send_to(self.sock.as_raw_fd(), to, buf).await,
+        }
     }
 
     // XXX put these futures into their own queue, separate from
@@ -245,10 +275,7 @@ impl JournalQuorumDriver {
             stream.from
         );
         let packet = RequestPacket {
-            header: PacketHeader {
-                msg_id: ((slot as u64) << 32) | (uid as u64),
-                reply_to: local_port,
-            },
+            header: PacketHeader::new(((slot as u64) << 32) | (uid as u64), local_port),
             request: req,
         };
         let mut bufs = Self::encode_many(&self.bufpool, spec.cluster_size, packet)
@@ -283,7 +310,7 @@ impl JournalQuorumDriver {
                         *remote,
                         _time
                     );
-                    return Some(async move { self.io.send_to(self.sock.as_raw_fd(), *remote, buf).await });
+                    return Some(async move { self.send_to(*remote, buf).await });
                 }))
                 .await;
                 // reclaim buffers once sends are done
@@ -393,13 +420,13 @@ impl JournalQuorumDriver {
         Err(RetryRequestError::TooManyRetries(spec.maj_timeout, spec.retries, t_start.elapsed()))
     }
 
-    pub(crate) fn encode_many<R: WireMessage<()>>(
+    pub(crate) fn encode_many<R: FramedPacket>(
         bufpool: &ThreadBuffers,
         n: usize,
         req: R,
     ) -> Result<impl Iterator<Item = IoBuffer>, EncodeError> {
         let mut first_buf = bufpool.pop();
-        let bytes = req.encode_into(first_buf.data_mut())?;
+        let bytes = req.encode_framed(first_buf.data_mut())?;
         first_buf.mark_used(bytes);
         let ptr = first_buf.ptr();
         let iter = std::iter::once(first_buf).chain(bufpool.iter().take(n - 1).map(move |mut buf| {
@@ -434,12 +461,17 @@ mod tests {
     fn test_encode_many() {
         let pool = local_packet_buffer_pool();
         let id = JournalId::dst_random();
-        let msg = JournalMetadataRequest { id: id.clone().into() };
+        let msg = RequestPacket {
+            header: PacketHeader::new(42, 1),
+            request: JournalMetadataRequest { id: id.clone().into() }.into(),
+        };
         let res: Vec<_> = JournalQuorumDriver::encode_many(&pool, 3, msg.clone()).expect("error encoding message").collect();
         debug_assert_eq!(res.len(), 3);
         let expected_id = id.into();
         for (idx, buf) in res.iter().enumerate() {
-            let (decoded, _size) = JournalMetadataRequest::decode_from(buf.as_slice()).expect("failed decoding buf");
+            let (decoded, size) = RequestPacket::decode_from(buf.as_slice()).expect("failed decoding buf");
+            assert_eq!(decoded.header.frag_len as usize, size, "buffer no {} has wrong frag_len", idx);
+            let JournalRequest::FetchMeta(decoded) = decoded.request else { panic!("wrong request type {:?}", decoded.request) };
             assert_eq!(decoded.id, expected_id, "buffer no {} mismatch: {} vs expected {}", idx, decoded.id, expected_id);
         }
     }

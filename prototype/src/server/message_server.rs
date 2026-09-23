@@ -12,8 +12,10 @@ use crate::{
         BufferPoolConfig, ThreadBuffers,
         buffer::IoBuf,
         local_buffer_pool,
+        udp_offload::{enable_offload_stats, print_offload_stats},
+        udp_send_queue::UdpSendQueue,
         uring::{IOEnterIntent, OpId},
-        watermark::{PacketConsumer, WatermarkRecv},
+        watermark::{PacketConsumer, RecvOptions, WatermarkRecv},
     },
     runtime::{
         Executor, ThreadRuntime,
@@ -27,7 +29,7 @@ use crate::{
     types::{
         id::JournalId,
         message::{AddEntryResponse, JournalMessageReceiver, JournalRequest, JournalResponse},
-        packet::{PacketHeader, RequestPacket, ResponsePacket},
+        packet::{FramedPacket, PacketHeader, RequestPacket, ResponsePacket},
         wire::WireMessage,
     },
 };
@@ -55,6 +57,8 @@ struct MessageServer<JournalStore: JournalMessageReceiver + 'static> {
     sock: std::net::UdpSocket,
     port: u16,
     id: usize,
+    udp_gro: bool,
+    send_queue: Option<Rc<UdpSendQueue>>,
     mesh_stats: UnsafeCell<(usize, usize)>,
 }
 
@@ -78,12 +82,21 @@ where
         sock: std::net::UdpSocket,
         port: u16,
         id: usize,
+        io_cfg: &'static IOConfig,
     ) -> Rc<Self> {
         let bound = exec.config().tasks_per_thread;
         let request_task_pool = local_buffer_pool(
             Self::REQUEST_FUTURE_SIZE,
             BufferPoolConfig::build_with(|buf_cfg| buf_cfg.prealloc_size = bound * Self::REQUEST_FUTURE_SIZE.next_power_of_two()),
         );
+        if io_cfg.udp_gro || io_cfg.udp_gso {
+            let interval = match io_cfg.udp_offload_stats_ms {
+                0 if cfg.print_event_loop_stats => 1000,
+                ms => ms,
+            };
+            enable_offload_stats(interval);
+        }
+        let send_queue = io_cfg.udp_gso.then(|| UdpSendQueue::new(sock.as_raw_fd(), exec.io(), true));
         Rc::new(Self {
             cfg,
             store,
@@ -94,8 +107,17 @@ where
             sock,
             port,
             id,
+            udp_gro: io_cfg.udp_gro,
+            send_queue,
             mesh_stats: UnsafeCell::new((0, 0)),
         })
+    }
+
+    fn recv_options(&self) -> RecvOptions {
+        RecvOptions {
+            framing: PacketHeader::FRAMING,
+            gro: self.udp_gro,
+        }
     }
 
     fn take_stats(&self) -> JournalStore::Metrics {
@@ -103,7 +125,7 @@ where
     }
 
     fn run2(self: &Rc<Self>, mut mesh: mesh::mailbox::Receiver<(RequestPacket, SocketAddr)>) -> ServerShutdownResult {
-        let recv = Rc::new(WatermarkRecv::new(self.sock.as_raw_fd(), self.exec.io().clone(), 32 as u16, self));
+        let recv = Rc::new(WatermarkRecv::with_options(self.sock.as_raw_fd(), self.exec.io().clone(), 32 as u16, self.recv_options(), self));
         // let (mut long_loops, mut loops) = (0, 0);
         // let mut loop_timer = MicrosecondMeasurement::new_started();
         while !self.exec.wind_down.get() {
@@ -135,11 +157,12 @@ where
         }
         // println!("id {} (thread {:?}) has {} journals, {:?} mesh sends/recvs", self.id, std::thread::current().id(), self.store.journal_count(), unsafe { *self.mesh_stats.get() });
         // println!("{}/{} = {}% long loops", long_loops, loops, 100.0 * (long_loops as f64) / (loops as f64));
+        print_offload_stats("server");
         ServerShutdownResult::Ok // XXX
     }
 
     fn run(self: &Rc<Self>, mut mesh: mesh::mailbox::Receiver<(RequestPacket, SocketAddr)>) -> ServerShutdownResult {
-        let recv = Rc::new(WatermarkRecv::new(self.sock.as_raw_fd(), self.exec.io().clone(), 32 as u16, self));
+        let recv = Rc::new(WatermarkRecv::with_options(self.sock.as_raw_fd(), self.exec.io().clone(), 32 as u16, self.recv_options(), self));
         let (mut long_loops, mut loops) = (0, 0);
         let mut loop_timer = MicrosecondMeasurement::new_started();
         while !self.exec.wind_down.get() {
@@ -170,6 +193,7 @@ where
         // println!("id {} (thread {:?}) has {} journals, {:?} mesh sends/recvs", self.id, std::thread::current().id(), self.store.journal_count(), unsafe { *self.mesh_stats.get() });
         // println!("{}/{} = {}% long loops", long_loops, loops, 100.0 * (long_loops as f64) / (loops as f64));
         log::trace!("message_server STOPPED polling {}", self.exec.wind_down.get());
+        print_offload_stats("server");
         ServerShutdownResult::Ok // XXX
     }
 
@@ -200,10 +224,7 @@ where
                         let res = self.shutdown().await;
                         // actually await this net send result here to ensure response
                         // is sent to client before the entire runtime shuts down
-                        let header = PacketHeader {
-                            msg_id: pkt.header.msg_id,
-                            reply_to: self.port,
-                        };
+                        let header = PacketHeader::new(pkt.header.msg_id, self.port);
                         log::info!("replying to shutdown request {:?} with {:?}", pkt.header, header);
                         self.net_send(header, res.clone().into(), fwd).await;
                         InternalRuntimeAction::DidShutDown(res)
@@ -217,10 +238,7 @@ where
         if target_proc == self.id {
             // XXX for latency testing purposes
             // let this: &'static Self = unsafe { std::mem::transmute(self) };
-            let header = PacketHeader {
-                msg_id: pkt.header.msg_id,
-                reply_to: self.port,
-            };
+            let header = PacketHeader::new(pkt.header.msg_id, self.port);
             log::trace!(
                 "Processing packet {} with logid {} myself ({}) at {}us",
                 pkt.header.msg_id,
@@ -277,7 +295,7 @@ where
         let mut outgoing = crate::io::local_packet_buffer_pool().pop();
         let _msgid = header.msg_id;
         let pkt = ResponsePacket { header, request };
-        let bytes = match pkt.encode_into(outgoing.as_mut_slice()) {
+        let bytes = match pkt.encode_framed(outgoing.as_mut_slice()) {
             Ok(bytes) => bytes,
             Err(encode_err) => {
                 log::error!("Got encoding error {:?}", encode_err);
@@ -286,7 +304,10 @@ where
         };
         outgoing.mark_used(bytes);
         // self.exec.io().clone().ff_send_to(self.sock.as_raw_fd(), addr, outgoing).await;
-        let (res, _buf) = self.exec.io().send_to(self.sock.as_raw_fd(), addr, outgoing).await;
+        let (res, _buf) = match &self.send_queue {
+            Some(queue) => queue.send_to(addr, outgoing).await,
+            None => self.exec.io().send_to(self.sock.as_raw_fd(), addr, outgoing).await,
+        };
         match res {
             Ok(written) => {
                 assert!(written == bytes);
@@ -308,10 +329,7 @@ where
         if self.id == 0 {
             // XXX prettier way of doing this?
             let msg = RequestPacket {
-                header: PacketHeader {
-                    msg_id: u64::MAX,
-                    reply_to: 0,
-                },
+                header: PacketHeader::new(u64::MAX, 0),
                 request: JournalRequest::Shutdown,
             };
             let addr = ([0, 0, 0, 0], 0u16).into();
@@ -355,16 +373,19 @@ impl<JournalStore> PacketConsumer for &Rc<MessageServer<JournalStore>>
 where
     JournalStore: JournalMessageReceiver + 'static,
 {
-    fn consume_raw(&self, result: i32, from: SocketAddr, buf: IoBuf, _opid: OpId) {
+    fn consume_raw(&self, result: i32, from: SocketAddr, buf: IoBuf, opid: OpId) {
         if result <= 0 {
             log::error!("tried to receive packet with error code {}", result);
             return;
         }
-        let bytes = result as usize;
-        let (pkt, _msgbytes) = match RequestPacket::decode_from(&buf.as_slice()[..bytes]) {
+        self.consume_datagram(from, &buf.as_slice()[..result as usize], opid);
+    }
+
+    fn consume_datagram(&self, from: SocketAddr, bytes: &[u8], _opid: OpId) {
+        let (pkt, _msgbytes) = match RequestPacket::decode_from(bytes) {
             Ok(pkt) => pkt,
             Err(decode_err) => {
-                log::error!("Error decoding message: {:?} <msg>{:?}</msg>, ignoring.", decode_err, buf.as_slice());
+                log::error!("Error decoding message: {:?} <msg>{:?}</msg>, ignoring.", decode_err, bytes);
                 return;
             }
         };
@@ -422,7 +443,7 @@ where
                 let sock = io.udp_bind((base_addr.ip(), port)).expect("error binding socket");
                 let myport = sock.local_addr().expect("error getting local address").port();
                 let (receiver, others) = mesh.join_as_full_node().await;
-                let server = MessageServer::new(server_cfg, store, server_exec(), others, sock, myport, myid);
+                let server = MessageServer::new(server_cfg, store, server_exec(), others, sock, myport, myid, io_cfg);
                 // exec.spawn_task({
                 //     let server = server.clone();
                 //     async move {

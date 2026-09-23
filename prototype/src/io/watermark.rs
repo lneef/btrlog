@@ -5,6 +5,7 @@ use crate::runtime::rcwaker::RcWaker;
 
 use super::ThreadBuffers;
 use super::buffer::IoBuf;
+use super::udp_offload::{self, RecvCmsgBuf, RecvFraming, Segments, enable_udp_gro, frag_len_matches, gro_segment_size};
 use super::uring::{IOEnterIntent, OpCompletionAction, OpId, OpUid, ThreadUring};
 use std::{
     cell::{Cell, UnsafeCell},
@@ -14,6 +15,40 @@ use std::{
 
 pub trait PacketConsumer {
     fn consume_raw(&self, _result: i32, _from: SocketAddr, _buf: IoBuf, _id: OpId) {}
+
+    /// One datagram (= message) of a GRO-coalesced buffer, only valid during
+    /// the call. The default copies it into its own buffer for `consume_raw`;
+    /// consumers that decode right away override this to skip the copy.
+    fn consume_datagram(&self, from: SocketAddr, datagram: &[u8], id: OpId) {
+        let mut buf = crate::io::local_packet_buffer_pool().pop();
+        buf.as_mut_slice()[..datagram.len()].copy_from_slice(datagram);
+        buf.mark_used(datagram.len());
+        self.consume_raw(datagram.len() as i32, from, buf, id)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RecvOptions {
+    /// how datagrams map to messages (and whether to check their length field)
+    pub framing: RecvFraming,
+    /// set UDP_GRO on the socket; coalesced buffers are split before delivery
+    pub gro: bool,
+}
+
+impl Default for RecvOptions {
+    fn default() -> Self {
+        Self {
+            framing: RecvFraming::Datagram,
+            gro: false,
+        }
+    }
+}
+
+/// what the kernel told us about a completed recvmsg besides the length
+#[derive(Debug, Clone, Copy, Default)]
+struct RecvMeta {
+    gro_segment_size: Option<usize>,
+    flags: i32,
 }
 
 type StateVec<T> = smallvec::SmallVec<[T; 32]>;
@@ -25,10 +60,12 @@ struct WatermarkState {
     data: StateVec<libc::msghdr>,
     msgname: StateVec<libc::sockaddr_in>,
     iov: StateVec<libc::iovec>,
+    cmsg: StateVec<RecvCmsgBuf>,
+    use_cmsg: bool,
 }
 
 impl WatermarkState {
-    fn new(iodepth: u32, watermark: u16) -> Self {
+    fn new(iodepth: u32, watermark: u16, use_cmsg: bool) -> Self {
         let mut free = StateVec::with_capacity(watermark.into());
         for i in 0..watermark {
             free.push(watermark - 1 - i);
@@ -40,6 +77,23 @@ impl WatermarkState {
             data: smallvec![Self::empty_msghdr(); watermark as usize],
             msgname: smallvec![Self::empty_addr(); watermark as usize],
             iov: smallvec![Self::empty_iovec(); watermark as usize],
+            cmsg: smallvec![RecvCmsgBuf::new(); if use_cmsg { watermark as usize } else { 0 }],
+            use_cmsg,
+        }
+    }
+
+    /// read before the slot is resubmitted, which resets the msghdr
+    #[inline]
+    fn recv_meta(&self, slot: u16) -> RecvMeta {
+        let idx = self.lookup[slot as usize] as usize;
+        if idx == 0xFFFF {
+            return RecvMeta::default();
+        }
+        let msg = &self.data[idx];
+        RecvMeta {
+            // SAFETY: msg_control is either null or points to our cmsg buffer
+            gro_segment_size: if self.use_cmsg { unsafe { gro_segment_size(msg) } } else { None },
+            flags: msg.msg_flags,
         }
     }
 
@@ -109,6 +163,12 @@ impl WatermarkState {
         data.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as u32;
         data.msg_iov = iov;
         data.msg_iovlen = 1;
+        data.msg_flags = 0;
+        if self.use_cmsg {
+            let cmsg = unsafe { self.cmsg.get_unchecked_mut(idx) };
+            data.msg_control = cmsg.0.as_mut_ptr() as *mut libc::c_void;
+            data.msg_controllen = cmsg.0.len();
+        }
         data
     }
 
@@ -149,20 +209,45 @@ pub struct WatermarkRecv<Consumer> {
     watermark: u16,
     wind_down: Cell<bool>,
     bufpool: ThreadBuffers,
+    framing: RecvFraming,
     consumer: Consumer,
 }
 
 impl<Consumer: PacketConsumer> WatermarkRecv<Consumer> {
     pub fn new(sock: impl std::os::fd::AsRawFd, io: ThreadUring, watermark: u16, consumer: Consumer) -> Rc<Self> {
+        Self::with_options(sock, io, watermark, RecvOptions::default(), consumer)
+    }
+
+    pub fn with_options(
+        sock: impl std::os::fd::AsRawFd,
+        io: ThreadUring,
+        watermark: u16,
+        opts: RecvOptions,
+        consumer: Consumer,
+    ) -> Rc<Self> {
         let iodepth = io.iodepth();
+        let socket = sock.as_raw_fd();
+        // only enable GRO here so a GRO socket always has a reader that splits
+        let gro = opts.gro
+            && match enable_udp_gro(socket) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("couldn't enable UDP_GRO on fd {}, continuing without: {}", socket, e);
+                    false
+                }
+            };
+        let bufpool = crate::io::local_packet_buffer_pool();
+        // 64KiB fits any datagram and the default GRO aggregate limit (gro_max_size)
+        debug_assert!(bufpool.buffer_size() >= 1 << 16);
         let res = Rc::new(Self {
-            socket: sock.as_raw_fd(),
+            socket,
             io,
-            state: UnsafeCell::new(WatermarkState::new(iodepth as u32, watermark)),
+            state: UnsafeCell::new(WatermarkState::new(iodepth as u32, watermark, gro)),
             watermark,
             wind_down: Cell::new(false),
-            bufpool: crate::io::local_packet_buffer_pool(),
+            bufpool,
             //bufpool: crate::io::local_io_buffer_pool(1 << 10),
+            framing: opts.framing,
             consumer,
         });
         for _ in 0..watermark {
@@ -172,6 +257,10 @@ impl<Consumer: PacketConsumer> WatermarkRecv<Consumer> {
             .access(|ctx| ctx.enter(IOEnterIntent::Submit))
             .expect("error during initial watermark submit");
         res
+    }
+
+    pub fn consumer(&self) -> &Consumer {
+        &self.consumer
     }
 
     pub fn active_op_count(&self) -> usize {
@@ -217,10 +306,11 @@ impl<Consumer: PacketConsumer> WatermarkRecv<Consumer> {
                         Some(x) => x, // an I/O known by us
                         None => return OpCompletionAction::TryWake,
                     };
+                    let meta = self.access(|state| state.recv_meta(opid.slot()));
                     let buf = std::mem::replace(unsafe { opref.buffer_ref().unwrap_unchecked() }, self.bufpool.pop());
                     debug_assert_eq!(uid, opid.uid());
                     debug_assert_eq!(_iobuf as *const u8, buf.ptr());
-                    self.consumer.consume_raw(result, from, buf, opid);
+                    self.deliver(result, from, buf, opid, meta);
                     // reuse operation slot directly by resubmitting an op with the same slot and ID
                     if self.wind_down.get() {
                         self.access(|state| state.free_slot(opid.slot()));
@@ -240,6 +330,38 @@ impl<Consumer: PacketConsumer> WatermarkRecv<Consumer> {
                 })
             })
             .expect("error")
+    }
+
+    /// Hands every datagram in `buf` to the consumer separately; with GRO,
+    /// `buf` may hold several datagrams of gso_size bytes (the last may be
+    /// shorter), each one message. Without coalescing, `buf` is passed on as is.
+    fn deliver(&self, result: i32, from: SocketAddr, buf: IoBuf, opid: OpId, meta: RecvMeta) {
+        if result <= 0 {
+            return self.consumer.consume_raw(result, from, buf, opid);
+        }
+        if std::hint::unlikely(meta.flags & libc::MSG_TRUNC != 0) {
+            log::error!("received truncated datagram ({}B) from {:?}", result, from);
+        }
+        let len = result as usize;
+        let segments = Segments::count(len, meta.gro_segment_size);
+        let mut mismatches = 0;
+        if segments == 1 {
+            mismatches += !frag_len_matches(&buf.as_slice()[..len], self.framing) as u64;
+            self.consumer.consume_raw(result, from, buf, opid);
+        } else {
+            for range in Segments::new(len, meta.gro_segment_size) {
+                let datagram = &buf.as_slice()[range];
+                mismatches += !frag_len_matches(datagram, self.framing) as u64;
+                self.consumer.consume_datagram(from, datagram, opid);
+            }
+        }
+        udp_offload::record(|s| {
+            s.recvs += 1;
+            s.recv_segments += segments as u64;
+            s.gro_multi_segment_recvs += (segments > 1) as u64;
+            s.frag_len_mismatches += mismatches;
+        });
+        udp_offload::maybe_report_offload_stats();
     }
 
     /// XXX result
@@ -272,11 +394,12 @@ impl<Consumer: PacketConsumer> WatermarkRecv<Consumer> {
         let opid = OpId::new(tag, opuid);
         self.io.access(|uring| {
             uring.access_pending_op(opid, |opref| {
+                let meta = self.access(|state| state.recv_meta(opid.slot()));
                 let buf = std::mem::replace(unsafe { opref.buffer_ref().unwrap_unchecked() }, self.bufpool.pop());
                 debug_assert_eq!(opref.op_uid(), opuid);
                 debug_assert_eq!(_iobuf as *const u8, buf.ptr());
                 debug_assert!(opref.result.is_some());
-                self.consumer.consume_raw(unsafe { opref.result.unwrap_unchecked() }, from, buf, opid);
+                self.deliver(unsafe { opref.result.unwrap_unchecked() }, from, buf, opid, meta);
                 // reuse operation slot directly by resubmitting an op with the same slot and ID
                 if self.wind_down.get() {
                     self.access(|state| state.free_slot(opid.slot()));
@@ -454,6 +577,82 @@ mod tests {
             })
             // now send udp messages to that socket and assert that they arrive
         });
+    }
+
+    /// GSO-send buffers of several equal-sized messages; the receiver must
+    /// hand out each message separately, with and without GRO coalescing
+    fn gso_send_framed_receive(gro: bool, recv_addr: SocketAddr, sender_addr: SocketAddr) {
+        use crate::io::udp_offload::{RecvFraming, write_frag_len};
+        const SEGMENT: usize = 64;
+        // [len: u32][payload], ASCII only so MockConsumer can compare strings
+        let framed = |tag: char, len: usize| {
+            let mut bytes = vec![tag as u8; len];
+            write_frag_len(&mut bytes, 0, len);
+            bytes
+        };
+        // one message per segment; the last one of a send may be shorter
+        let sends: Vec<Vec<Vec<u8>>> = vec![
+            vec![framed('a', 64), framed('b', 64), framed('c', 40)],
+            vec![framed('d', 64), framed('e', 64), framed('f', 64)],
+        ];
+        let messages: Vec<String> = sends
+            .iter()
+            .flatten()
+            .map(|m| String::from_utf8(m.clone()).expect("framed message not utf8"))
+            .collect();
+        let barrier = &std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            s.spawn({
+                let messages = messages.clone();
+                move || {
+                    let ring = ThreadUring::new(Default::default()).expect("error creating uring");
+                    let sock = ring.udp_bind(recv_addr).expect("error binding recv socket");
+                    let opts = RecvOptions {
+                        framing: RecvFraming::LengthChecked { offset: 0 },
+                        gro,
+                    };
+                    let watermark = WatermarkRecv::with_options(sock.as_raw_fd(), ring.clone(), 4, opts, MockConsumer::new(sender_addr, messages));
+                    barrier.wait();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while !watermark.consumer.all_done() && std::time::Instant::now() < deadline {
+                        ring.enter(IOEnterIntent::Submit);
+                        watermark.poll_completed();
+                    }
+                    watermark.consumer.assert_all_received_exactly_once();
+                    let stats = udp_offload::thread_offload_stats();
+                    assert_eq!(stats.frag_len_mismatches, 0);
+                    assert_eq!(stats.recv_segments, 6);
+                    assert_eq!(stats.gro_multi_segment_recvs > 0, gro, "{}", stats);
+                }
+            });
+
+            test_rt().with_executor(Default::default(), || async move {
+                let sock = test_exec().io().udp_bind(sender_addr).expect("error binding sender socket");
+                let bufpool = crate::io::local_packet_buffer_pool();
+                barrier.wait();
+                for segments in sends.iter() {
+                    let mut buf = bufpool.pop();
+                    let mut len = 0;
+                    for msg in segments {
+                        buf.as_mut_slice()[len..len + msg.len()].copy_from_slice(msg);
+                        len += msg.len();
+                    }
+                    buf.mark_used(len);
+                    let (res, _buf) = test_exec().io().send_to_gso(sock.as_raw_fd(), recv_addr, buf, SEGMENT as u16).await;
+                    assert_eq!(res.expect("error sending gso buffer"), len);
+                }
+            })
+        });
+    }
+
+    #[test]
+    fn test_gso_send_gro_receive() {
+        gso_send_framed_receive(true, "127.0.4.40:8400".parse().unwrap(), "127.0.5.40:8401".parse().unwrap());
+    }
+
+    #[test]
+    fn test_gso_send_plain_receive() {
+        gso_send_framed_receive(false, "127.0.4.41:8410".parse().unwrap(), "127.0.5.41:8411".parse().unwrap());
     }
 
     /// Test using watermark recv via async/waker interface

@@ -334,7 +334,16 @@ pub struct UringContext {
     /// Allow waking once objects have been submitted
     submission_wakers: WakerList,
     /// idempotency for completion handling
-    am_in_completion: Cell<bool>
+    am_in_completion: Cell<bool>,
+    /// called on every enter before submitting, e.g. to flush queued sends
+    presubmit_hooks: Vec<std::rc::Weak<dyn PreSubmitHook>>,
+}
+
+/// Lets I/O producers that collect work across tasks (e.g. the UDP send
+/// queue) enqueue their SQEs right before the ring is entered.
+pub(crate) trait PreSubmitHook {
+    /// returns the number of enqueued SQEs
+    fn before_submit(self: Rc<Self>, ctx: &mut UringContext) -> usize;
 }
 
 impl Drop for UringContext {
@@ -401,7 +410,8 @@ impl UringContext {
             stats: IOStats::default(),
             doorbell: DoorbellState::new()?,
             submission_wakers: WakerList::new(),
-            am_in_completion: Cell::new(false)
+            am_in_completion: Cell::new(false),
+            presubmit_hooks: Vec::new(),
         };
         res.stats.global_start_time.start_measurement();
         Ok(res)
@@ -494,8 +504,25 @@ impl UringContext {
         res
     }
 
+    fn run_presubmit_hooks(&mut self) -> usize {
+        let mut enqueued = 0;
+        let mut hooks = std::mem::take(&mut self.presubmit_hooks);
+        hooks.retain(|hook| match hook.upgrade() {
+            Some(hook) => {
+                enqueued += hook.before_submit(self);
+                true
+            }
+            None => false, // owner is gone
+        });
+        // keep hooks registered from within a hook
+        hooks.append(&mut self.presubmit_hooks);
+        self.presubmit_hooks = hooks;
+        enqueued
+    }
+
     /// Submit operations without blocking
     pub fn enter(&mut self, intent: IOEnterIntent) -> io::Result<usize> {
+        let hook_sqes = if self.presubmit_hooks.is_empty() { 0 } else { self.run_presubmit_hooks() };
         match intent {
             IOEnterIntent::Poll => {
                 self.stats.intents_polling += 1;
@@ -509,7 +536,7 @@ impl UringContext {
                         let batch_based = self.ring.submission().len() >= self.submit_threshold;
                         // XXX do this? don't enter if there were completions even if other conditions fulfilled?
                         let time_based = self.stats.last_submit.stop_measurement() >= Self::MAX_SUBMIT_MICROS;
-                        batch_based || time_based
+                        batch_based || time_based || hook_sqes > 0
                     }
                 };
                 if enter { self.submit_inner(intent, 0) } else { Ok(0) }
@@ -517,7 +544,8 @@ impl UringContext {
             IOEnterIntent::Starved => {
                 self.stats.intents_starved += 1;
                 if self.poll_completions()? > 0 {
-                    return Ok(0);
+                    // don't delay sends queued by hooks until the next enter
+                    return if hook_sqes > 0 { self.submit_inner(IOEnterIntent::Submit, 0) } else { Ok(0) };
                 }
                 let will_be_woken = if self.config.allow_parking {
                     self.stats.outstanding_ios
@@ -858,6 +886,11 @@ impl ThreadUring {
 
     pub fn unpark(&self) {
         let _ = self.access(|uring| uring.request_unpark());
+    }
+
+    /// `hook` is called on every enter until its owner is dropped
+    pub(crate) fn register_presubmit_hook(&self, hook: std::rc::Weak<dyn PreSubmitHook>) {
+        self.access(|uring| uring.presubmit_hooks.push(hook));
     }
 
     #[allow(dead_code)]
@@ -1369,6 +1402,48 @@ impl ThreadUring {
                 self.send(sock, to_raw, buf).await
             }
         }
+    }
+
+    /// Sends `buf` with one sendmsg as consecutive datagrams of `segment_size`
+    /// bytes (the last one may be shorter), segmented by the kernel or NIC (UDP GSO).
+    /// Every segment must be exactly one message, see `io::udp_offload`.
+    /// Fails with EIO/EINVAL if the egress device can't do checksum offload or
+    /// `segment_size` exceeds the path MTU.
+    pub async fn send_to_gso(
+        &self,
+        sock: impl AsRawFd,
+        addr: SocketAddr,
+        buf: IoBuf,
+        segment_size: u16,
+    ) -> (io::Result<usize>, IoBuf) {
+        use super::udp_offload::{MAX_GSO_SEGMENTS, SendCmsgBuf};
+        let len = buf.used_bytes();
+        debug_assert!(segment_size > 0 && len <= segment_size as usize * MAX_GSO_SEGMENTS);
+        // all of these must live until completion; they do since we await it here
+        let to = SockAddr::from(addr);
+        let mut iovec = libc::iovec {
+            iov_base: buf.ptr_mut() as *mut libc::c_void,
+            iov_len: len,
+        };
+        let mut msg = libc::msghdr {
+            msg_name: to.as_ptr() as *mut libc::c_void, // not written by sendmsg
+            msg_namelen: to.len(),
+            msg_iov: &mut iovec as *mut libc::iovec,
+            msg_iovlen: 1,
+            msg_control: std::ptr::null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+        let mut cmsg = SendCmsgBuf::new();
+        if len > segment_size as usize {
+            // a single segment is a regular datagram
+            cmsg.attach_segment_size(&mut msg, segment_size);
+        }
+        let fd = sock.as_raw_fd();
+        self.generic_buffer_op(RequestTracingType::Send, buf, |_op_id, _buf| {
+            opcode::SendMsg::new(types::Fd(fd), &msg as *const libc::msghdr).build()
+        })
+        .await
     }
 
     pub async fn ff_send_to(&self, sock: impl AsRawFd, addr: SocketAddr, buf: IoBuf) {
