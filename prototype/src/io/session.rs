@@ -538,9 +538,14 @@ mod tests {
 
     /// Server manager with one accepted session and its peer.
     fn accepted() -> (SessionManager<Ends>, SessionId, TcpStream) {
+        accepted_with(false)
+    }
+
+    fn accepted_with(zerocopy_send: bool) -> (SessionManager<Ends>, SessionId, TcpStream) {
         let io = ThreadUring::new_with(|cfg| {
             cfg.sq_entries = 8;
             cfg.cq_entries = 8;
+            cfg.zerocopy_send = zerocopy_send;
         })
         .expect("ring creation failed");
         let listener = io.tcp_listener(([127, 0, 0, 1], 0)).expect("listen failed");
@@ -665,6 +670,66 @@ mod tests {
         let addr = mgr.open_stream(slt).expect("stream table full");
         assert!(mgr.send(packet(), &addr).is_ok());
         mgr.close_stream(&addr);
+    }
+
+    #[test]
+    fn test_zero_copy_detached_send_releases_its_buffer() {
+        let (mgr, slt, mut client) = accepted_with(true);
+        let idle = mgr.io().current_outstanding();
+        let addr = mgr.open_stream(slt).expect("stream table full");
+        assert!(mgr.send(packet(), &addr).is_ok());
+        drive(&mgr, || !mgr.stream_busy(&addr));
+        assert_eq!(
+            mgr.io().current_outstanding(),
+            idle,
+            "buffer released before the notification"
+        );
+        read_exact(&mut client, 4);
+        mgr.close_stream(&addr);
+        assert_eq!(mgr.session_health(slt), Some(SessionHealth::Healthy));
+    }
+
+    #[test]
+    fn test_zero_copy_put_completes() {
+        let (mgr, slt, mut client) = accepted_with(true);
+        let idle = mgr.io().current_outstanding();
+        let addr = mgr.open_stream(slt).expect("stream table full");
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        let mut put = std::pin::pin!(staged_put(&mgr, &addr));
+        assert!(put.as_mut().poll(&mut cx).is_pending(), "send staged");
+        let mut done = None;
+        for _ in 0..10_000 {
+            mgr.enter(IOEnterIntent::Poll);
+            mgr.manage().expect("manage failed");
+            if let Poll::Ready(res) = put.as_mut().poll(&mut cx) {
+                done = Some(res);
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        let (res, _buf) = done.expect("put never completed");
+        assert_eq!(res.unwrap(), 4);
+        assert_eq!(mgr.io().current_outstanding(), idle, "put completed before the notification");
+        read_exact(&mut client, 4);
+    }
+
+    #[test]
+    fn test_zero_copy_send_error_releases_detached_sends() {
+        let (mgr, slt, _client) = accepted_with(true);
+        let first = mgr.open_stream(slt).expect("stream table full");
+        let second = mgr.open_stream(slt).expect("stream table full");
+        let fd = mgr.access(|ctx| ctx.socks.index(slt.slot()).unwrap().raw_fd());
+        assert_eq!(unsafe { libc::shutdown(fd, libc::SHUT_WR) }, 0);
+        assert!(mgr.send(packet(), &first).is_ok());
+        mgr.enter(IOEnterIntent::Poll);
+        assert!(mgr.send(packet(), &second).is_ok());
+        drive(&mgr, || ends(&mgr).len() == 2);
+        assert!(!mgr.stream_busy(&first) && !mgr.stream_busy(&second));
+        assert_eq!(mgr.session_health(slt), Some(SessionHealth::Failed(-libc::EPIPE)));
+        assert_eq!(sessions(&mgr), [slt], "open streams hold the session");
+        mgr.close_stream(&first);
+        mgr.close_stream(&second);
+        assert!(sessions(&mgr).is_empty());
     }
 
     #[test]

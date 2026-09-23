@@ -141,6 +141,10 @@ pub struct IOConfig {
     /// [io] NAPI busy poll time per ring in microseconds, 0 disables NAPI
     #[arg(long, env, default_value_t = 0)]
     pub napi_busy_poll_us: u32,
+
+    /// [io] Send session streams with zero-copy sendmsg
+    #[arg(long, env, default_value_t = false)]
+    pub zerocopy_send: bool,
 }
 
 impl IOConfig {

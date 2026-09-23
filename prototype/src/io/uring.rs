@@ -204,6 +204,8 @@ pub struct UringConfig {
     /// provided buffers for multishot recv; power of two
     pub buf_ring_entries: u16,
     pub napi: NapiConfig,
+    /// session sends use SendMsgZc
+    pub zerocopy_send: bool,
 }
 impl UringConfig {
     pub fn with<F: FnOnce(&mut Self)>(mut self, f: F) -> Self {
@@ -239,6 +241,7 @@ impl Default for UringConfig {
             print_slow_submits: true,
             buf_ring_entries: 512,
             napi: Default::default(),
+            zerocopy_send: false,
         }
     }
 }
@@ -274,6 +277,7 @@ impl From<(&IOConfig, usize)> for UringConfig {
             s.print_slow_submits = false;
             s.napi.enabled = cfg.napi_busy_poll_us > 0;
             s.napi.busy_poll_us = cfg.napi_busy_poll_us;
+            s.zerocopy_send = cfg.zerocopy_send;
         })
     }
 }
@@ -731,6 +735,29 @@ impl UringContext {
             if let Some(pending_op) = self.slots.get_mut(op_id.slot() as usize) {
                 // Check if slot is occupied (op_id != 0) and matches
                 if pending_op.uid == op_id.uid() {
+                    if let Some(kind) = pending_op.session
+                        && kind.zero_copy()
+                    {
+                        // F_MORE on the send result announces a notification once the pages are released
+                        if more {
+                            assert!(pending_op.result.is_none(), "zero-copy send completed twice");
+                            pending_op.result = Some(result);
+                            continue;
+                        }
+                        let result = if cqueue::notif(flags) {
+                            pending_op
+                                .result
+                                .take()
+                                .expect("zero-copy notification before its send completion")
+                        } else {
+                            result
+                        };
+                        let cqe = RawCqe { result, flags: 0 };
+                        self.session_done.push_back(SessionEvent { kind, cqe });
+                        *pending_op = PendingOp::empty(self.stats.submission_epoch);
+                        self.free_slots.push(op_id.slot());
+                        continue;
+                    }
                     if let Some(kind) = pending_op.session {
                         let cqe = RawCqe { result, flags };
                         if kind.dispatchable(result) {
@@ -1028,6 +1055,7 @@ enum SessionOp {
         fd: RawFd,
         slot: IndexSlotId,
         msg: *const libc::msghdr,
+        zc: bool,
     },
 }
 
@@ -1038,10 +1066,17 @@ impl SessionOp {
                 .flags(libc::SOCK_CLOEXEC)
                 .build(),
             Self::Recv { fd, .. } => buf_ring.recv_multi(fd),
-            Self::Send { fd, msg, .. } => opcode::SendMsg::new(types::Fd(fd), msg)
+            Self::Send { fd, msg, zc: false, .. } => opcode::SendMsg::new(types::Fd(fd), msg)
+                .flags(libc::MSG_NOSIGNAL as u32)
+                .build(),
+            Self::Send { fd, msg, zc: true, .. } => opcode::SendMsgZc::new(types::Fd(fd), msg)
                 .flags(libc::MSG_NOSIGNAL as u32)
                 .build(),
         }
+    }
+
+    fn zero_copy(&self) -> bool {
+        matches!(self, Self::Send { zc: true, .. })
     }
 
     fn live(&self, result: i32) -> bool {
@@ -1224,13 +1259,17 @@ impl ThreadUring {
     }
 
     /// Submits the sendmsg on the next `enter`; the completion arrives via `on_sent`.
+    /// A zero-copy send completes once the kernel released its buffers.
     pub fn send_stream(&self, sock: &impl AsRawFd, slot: IndexSlotId, msg: *const libc::msghdr) {
-        let kind = SessionOp::Send {
-            fd: sock.as_raw_fd(),
-            slot,
-            msg,
-        };
-        self.access(|ctx| ctx.submit_session_op(kind));
+        self.access(|ctx| {
+            let kind = SessionOp::Send {
+                fd: sock.as_raw_fd(),
+                slot,
+                msg,
+                zc: ctx.config.zerocopy_send,
+            };
+            ctx.submit_session_op(kind)
+        });
     }
 
     pub fn poll_completion(
@@ -2606,5 +2645,93 @@ mod multishot_tests {
             io.sleep(Duration::from_millis(1)).await.unwrap();
         }
         assert_eq!(table.borrow().data[2].1, b"still open");
+    }
+
+    const CQE_F_MORE: u32 = 1 << 1;
+    const CQE_F_NOTIF: u32 = 1 << 3;
+
+    /// Posts a CQE for `op_id` to the ring itself.
+    fn post_cqe(io: &ThreadUring, op_id: OpId, result: i32, flags: u32) {
+        io.access(|ctx| {
+            let sqe = opcode::MsgRingData::new(
+                types::Fd(ctx.ring.as_raw_fd()),
+                result,
+                op_id.into_user_data(),
+                Some(flags),
+            )
+            .build()
+            .user_data(UringContext::CANCEL_USER_DATA);
+            ctx.enqueue(sqe).expect("SQ full");
+        });
+    }
+
+    fn harvest_until(io: &ThreadUring, outstanding: usize) {
+        for _ in 0..10_000 {
+            io.enter(IOEnterIntent::Poll);
+            if io.current_outstanding() == outstanding {
+                return;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        panic!("posted completions never arrived");
+    }
+
+    fn drain_sent(io: &ThreadUring) -> Vec<(IndexSlotId, Result<usize, Option<i32>>)> {
+        let mut sent = Vec::new();
+        io.drain_sessions(
+            |_| panic!("unexpected accept"),
+            |_, _| panic!("unexpected recv"),
+            |slot, res| sent.push((slot, res.map_err(|e| e.raw_os_error()))),
+        );
+        sent
+    }
+
+    /// Zero-copy send op that owns no SQE.
+    fn fake_zero_copy_send(io: &ThreadUring, slot: IndexSlotId) -> OpId {
+        io.access(|ctx| {
+            let (op_id, op) = ctx.register_new_pending_op().expect("no op slots");
+            op.session = Some(SessionOp::Send {
+                fd: -1,
+                slot,
+                msg: std::ptr::null(),
+                zc: true,
+            });
+            // stands in for the send's SQE
+            ctx.stats.outstanding_ios += 1;
+            op_id
+        })
+    }
+
+    #[test]
+    fn test_zero_copy_send_waits_for_its_notification() {
+        assert!(cqueue::more(CQE_F_MORE) && cqueue::notif(CQE_F_NOTIF));
+        let io = small_ring(8);
+        let mut sessions = IndexableSlotStorage::<()>::new(1);
+        let slot = sessions.get().expect("session slot");
+        let op_id = fake_zero_copy_send(&io, slot);
+        let live = |io: &ThreadUring| {
+            io.access(|ctx| ctx.slots[op_id.slot() as usize].uid == op_id.uid())
+        };
+
+        post_cqe(&io, op_id, 4096, CQE_F_MORE);
+        harvest_until(&io, 1);
+        assert!(drain_sent(&io).is_empty(), "send reported before its notification");
+        assert!(live(&io), "op slot freed before its notification");
+
+        post_cqe(&io, op_id, 0, CQE_F_NOTIF);
+        harvest_until(&io, 0);
+        assert_eq!(drain_sent(&io), [(slot, Ok(4096))]);
+        assert!(!live(&io), "op slot outlives its notification");
+    }
+
+    #[test]
+    fn test_zero_copy_send_without_notification_completes_at_once() {
+        let io = small_ring(8);
+        let mut sessions = IndexableSlotStorage::<()>::new(1);
+        let slot = sessions.get().expect("session slot");
+        let op_id = fake_zero_copy_send(&io, slot);
+        post_cqe(&io, op_id, -libc::EINVAL, 0);
+        harvest_until(&io, 0);
+        assert_eq!(drain_sent(&io), [(slot, Err(Some(libc::EINVAL)))]);
     }
 }
