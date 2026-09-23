@@ -675,7 +675,6 @@ mod tests {
     #[test]
     fn test_zero_copy_detached_send_releases_its_buffer() {
         let (mgr, slt, mut client) = accepted_with(true);
-        mgr.enter(IOEnterIntent::Poll);
         let idle = mgr.io().current_outstanding();
         let addr = mgr.open_stream(slt).expect("stream table full");
         assert!(mgr.send(packet(), &addr).is_ok());
@@ -693,7 +692,6 @@ mod tests {
     #[test]
     fn test_zero_copy_put_completes() {
         let (mgr, slt, mut client) = accepted_with(true);
-        mgr.enter(IOEnterIntent::Poll);
         let idle = mgr.io().current_outstanding();
         let addr = mgr.open_stream(slt).expect("stream table full");
         let mut cx = std::task::Context::from_waker(Waker::noop());
