@@ -204,6 +204,8 @@ pub struct UringConfig {
     /// provided buffers for multishot recv; power of two
     pub buf_ring_entries: u16,
     pub napi: NapiConfig,
+    /// session sends try a direct sendmsg first
+    pub inline_stream_send: bool,
 }
 impl UringConfig {
     pub fn with<F: FnOnce(&mut Self)>(mut self, f: F) -> Self {
@@ -239,6 +241,7 @@ impl Default for UringConfig {
             print_slow_submits: true,
             buf_ring_entries: 512,
             napi: Default::default(),
+            inline_stream_send: false,
         }
     }
 }
@@ -274,6 +277,7 @@ impl From<(&IOConfig, usize)> for UringConfig {
             s.print_slow_submits = false;
             s.napi.enabled = cfg.napi_busy_poll_us > 0;
             s.napi.busy_poll_us = cfg.napi_busy_poll_us;
+            s.inline_stream_send = cfg.inline_send;
         })
     }
 }
@@ -1223,6 +1227,10 @@ impl ThreadUring {
     /// The op ends with -ECANCELED on a later `poll_completion`.
     pub fn cancel_session_op(&self, op_id: OpId) {
         self.access(|ctx| ctx.cancel_session_op(op_id));
+    }
+
+    pub fn inline_stream_send(&self) -> bool {
+        self.access(|ctx| ctx.config.inline_stream_send)
     }
 
     /// Submits the sendmsg on the next `enter`; the completion arrives via `on_sent`.

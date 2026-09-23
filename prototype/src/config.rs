@@ -141,6 +141,10 @@ pub struct IOConfig {
     /// [io] NAPI busy poll time per ring in microseconds, 0 disables NAPI
     #[arg(long, env, default_value_t = 0)]
     pub napi_busy_poll_us: u32,
+
+    /// [io] try a direct sendmsg before handing a session send to the ring
+    #[arg(long, env, default_value_t = false)]
+    pub inline_send: bool,
 }
 
 impl IOConfig {
