@@ -7,8 +7,8 @@ use std::rc::Rc;
 use super::ThreadUring;
 use super::buffer::IoBuf;
 use super::slot_storage::{IndexSlotId, IndexableSlotStorage};
-use super::stream::{MessageConsumer, STREAM_CLOSED, StreamId, StreamManager, StreamState};
-use super::uring::IOEnterIntent;
+use super::stream::{MessageConsumer, StreamId, StreamManager, StreamSendFuture, StreamState};
+use super::uring::{IOEnterIntent, OpId};
 
 #[inline]
 fn io_error<T>(errno: i32) -> io::Result<T> {
@@ -23,18 +23,46 @@ pub enum SessionHealth {
     Failed(i32),
 }
 
+impl SessionHealth {
+    /// Positive errno reported to sends of an ended session.
+    fn errno(self) -> Option<i32> {
+        match self {
+            Self::Healthy => None,
+            Self::Closed => Some(libc::EPIPE),
+            Self::Failed(err) => Some(-err),
+        }
+    }
+}
+
 pub(crate) struct Session {
     fd: OwnedFd,
-    mux: StreamManager,
+    manager: StreamManager,
     health: SessionHealth,
+    recv: Option<OpId>,
 }
 
 impl Session {
     fn new(fd: OwnedFd, client: bool) -> Self {
         Self {
             fd,
-            mux: StreamManager::new(client),
+            manager: StreamManager::new(client),
             health: SessionHealth::Healthy,
+            recv: None,
+        }
+    }
+
+    fn ref_cnt(&self) -> usize {
+        self.manager.ref_cnt() + self.recv.is_some() as usize
+    }
+
+    fn arm_recv(&mut self, io: &ThreadUring, slot: SessionId) {
+        assert!(self.recv.is_none(), "recv armed twice");
+        self.recv = Some(io.recv_multi(&self.fd, slot.slot()));
+    }
+
+    fn cancel_recv(&mut self, io: &ThreadUring) {
+        if let Some(op) = self.recv {
+            io.cancel_session_op(op);
         }
     }
 
@@ -42,25 +70,95 @@ impl Session {
         self.health
     }
 
-    pub(crate) fn fail(&mut self, err: i32) {
+    /// The first end of a session sticks.
+    fn end(&mut self, health: SessionHealth) {
         if self.health == SessionHealth::Healthy {
-            self.health = SessionHealth::Failed(err);
+            self.health = health;
         }
-        self.mux_mut().fail(err);
     }
 
-    pub(crate) fn close(&mut self) {
-        if self.health == SessionHealth::Healthy {
-            self.health = SessionHealth::Closed;
+    /// Fails the staged sends of an ended session once the kernel holds none.
+    fn settle(&mut self) {
+        if let Some(errno) = self.health.errno()
+            && self.manager.state() != StreamState::Kernel
+        {
+            self.manager.fail_queued(-errno);
         }
+        debug_assert!(
+            self.health == SessionHealth::Healthy || self.manager.state() != StreamState::Queued,
+            "staged sends outlive the session"
+        );
     }
 
     pub(crate) fn raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 
-    pub(crate) fn mux_mut(&mut self) -> &mut StreamManager {
-        &mut self.mux
+    /// None once the session ended, its streams got their end notification.
+    fn open_stream(&mut self) -> Option<StreamId> {
+        if self.health != SessionHealth::Healthy {
+            return None;
+        }
+        self.manager.open_stream()
+    }
+
+    fn close_stream(&mut self, id: StreamId) {
+        self.manager.close_stream(id);
+    }
+
+    fn stage(
+        &mut self,
+        buf: IoBuf,
+        id: StreamId,
+    ) -> Result<(StreamSendFuture, bool), (i32, IoBuf)> {
+        if let Some(errno) = self.health.errno() {
+            return Err((errno, buf));
+        }
+        self.manager
+            .stage(buf, id)
+            .map_err(|buf| (libc::EBADF, buf))
+    }
+
+    /// True when sends are left to submit.
+    fn reap(&mut self, res: io::Result<usize>) -> bool {
+        let res = res.map_err(|e| -e.raw_os_error().expect("send completion without an errno"));
+        if let Err(err) = res {
+            self.end(SessionHealth::Failed(err));
+        }
+        let again = self.manager.reap(res);
+        self.settle();
+        again && self.health == SessionHealth::Healthy
+    }
+
+    /// None when no send is queued.
+    fn prepare(&mut self) -> Option<*const libc::msghdr> {
+        (self.manager.state() == StreamState::Queued).then(|| self.manager.prepare())
+    }
+
+    fn on_recv<C: MessageConsumer>(
+        &mut self,
+        res: io::Result<&[u8]>,
+        slot: SessionId,
+        consumer: &C,
+    ) {
+        let end = match res {
+            Ok(data) if !data.is_empty() => return self.manager.on_data(data, slot, consumer),
+            Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                log::warn!("recv buffers exhausted on session {:?}", slot);
+                return;
+            }
+            Ok(_) => SessionHealth::Closed,
+            Err(e) if e.raw_os_error() == Some(libc::ECANCELED) => SessionHealth::Closed,
+            Err(e) => SessionHealth::Failed(-e.raw_os_error().unwrap_or(libc::EIO)),
+        };
+        self.recv = None;
+        self.end(end);
+        let err = match self.health {
+            SessionHealth::Failed(err) => Some(io::Error::from_raw_os_error(-err)),
+            _ => None,
+        };
+        self.manager.on_end(err, slot, consumer);
+        self.settle();
     }
 }
 
@@ -68,6 +166,18 @@ pub(crate) struct SessionManagerContext {
     pub(crate) socks: IndexableSlotStorage<Session>,
     accepted: Vec<SessionId>,
     queued: Vec<SessionId>,
+}
+
+impl SessionManagerContext {
+    /// Frees the slot of a closed session no stream or kernel op refers to.
+    fn release_if_unused(&mut self, slt: SessionId) {
+        let unused = self.socks.index(slt.slot()).is_some_and(|session| {
+            session.health() != SessionHealth::Healthy && session.ref_cnt() == 0
+        });
+        if unused {
+            self.socks.put(slt.slot());
+        }
+    }
 }
 
 pub struct SessionManager<C: MessageConsumer> {
@@ -156,7 +266,7 @@ impl<C: MessageConsumer> SessionManager<C> {
     }
 
     pub fn open_stream(&self, slt: SessionId) -> Option<SessionAddr> {
-        let stream = self.access(|ctx| ctx.socks.index_mut(slt.slot())?.mux_mut().open_stream())?;
+        let stream = self.access(|ctx| ctx.socks.index_mut(slt.slot())?.open_stream())?;
         Some(SessionAddr::new(slt, stream))
     }
 
@@ -165,75 +275,61 @@ impl<C: MessageConsumer> SessionManager<C> {
             ctx.socks
                 .index_mut(addr.session.slot())
                 .expect("close_stream on an unknown session")
-                .mux_mut()
                 .close_stream(addr.stream);
+            ctx.release_if_unused(addr.session);
+        });
+    }
+
+    /// The recv ends with -ECANCELED, which closes the session.
+    pub fn cancel_recv(&self, slt: SessionId) {
+        self.access(|ctx| {
+            if let Some(session) = ctx.socks.index_mut(slt.slot()) {
+                session.cancel_recv(&self.io);
+            }
         });
     }
 
     pub async fn put(&self, buf: IoBuf, addr: &SessionAddr) -> (io::Result<usize>, IoBuf) {
-        let session = unsafe { &mut *self.ctx.get() }
-            .socks
-            .index_mut(addr.session.slot());
-        let session = match session {
-            Some(session) => session,
-            None => return (io_error(libc::EBADF), buf),
-        };
-        match session.health() {
-            SessionHealth::Healthy => {}
-            SessionHealth::Closed => return (io_error(libc::EPIPE), buf),
-            SessionHealth::Failed(err) => return (io_error(-err), buf),
+        let staged = self.access(|ctx| {
+            let Some(session) = ctx.socks.index_mut(addr.session.slot()) else {
+                return Err((libc::EBADF, buf));
+            };
+            let (fut, queue) = session.stage(buf, addr.stream)?;
+            if queue {
+                ctx.queued.push(addr.session);
+            }
+            Ok(fut)
+        });
+        match staged {
+            Ok(fut) => fut.await,
+            Err((errno, buf)) => (io_error(errno), buf),
         }
-        let (fut, queue) = match session.mux_mut().stage(buf, addr.stream) {
-            Ok(staged) => staged,
-            Err(buf) => return (io_error(libc::EBADF), buf),
-        };
-        if queue {
-            self.access(|ctx| ctx.queued.push(addr.session));
-        }
-        fut.await
     }
 
     fn reap(&self, slt: SessionId, res: io::Result<usize>) {
-        match res {
-            Err(err) => {
-                let errno = err
-                    .raw_os_error()
-                    .expect("send completion without an errno");
-                assert!(errno > 0, "raw_os_error yields a positive errno");
-                self.access(|ctx| {
-                    let failed = ctx.socks.index_mut(slt.slot()).map(|s| {
-                        s.fail(-errno);
-                    });
-                    assert!(failed.is_none());
-                });
+        self.access(|ctx| {
+            let Some(session) = ctx.socks.index_mut(slt.slot()) else {
+                return;
+            };
+            if session.reap(res) {
+                ctx.queued.push(slt);
             }
-            Ok(res) => {
-                self.access(|ctx| {
-                    let again = ctx
-                        .socks
-                        .index_mut(slt.slot())
-                        .map(|s| s.mux_mut().reap(res));
-                    match again {
-                        Some(true) => ctx.queued.push(slt),
-                        Some(false) => panic!("not implemented"),
-                        None => {}
-                    }
-                });
+            if session.health() != SessionHealth::Healthy {
+                session.cancel_recv(&self.io);
             }
-        }
+            ctx.release_if_unused(slt);
+        });
     }
 
     fn submit_streams(&self) {
         let mut queued = self.access(|ctx| std::mem::take(&mut ctx.queued));
         for slt in queued.drain(..) {
             self.access(|ctx| {
-                if let Some(session) = ctx.socks.index_mut(slt.slot()) {
-                    if session.mux_mut().state() != StreamState::Queued {
-                        return;
-                    }
-                    let fd = session.raw_fd();
-                    let msg = session.mux_mut().prepare();
-                    self.io.send_stream(&fd, slt.slot(), msg);
+                let Some(session) = ctx.socks.index_mut(slt.slot()) else {
+                    return;
+                };
+                if let Some(msg) = session.prepare() {
+                    self.io.send_stream(&session.raw_fd(), slt.slot(), msg);
                 }
             });
         }
@@ -262,13 +358,12 @@ impl<C: MessageConsumer> SessionManager<C> {
         )?;
         let mut accepted = self.access(|ctx| std::mem::take(&mut ctx.accepted));
         for slot in accepted.drain(..) {
-            let fd = self.access(|ctx| {
+            self.access(|ctx| {
                 ctx.socks
-                    .index(slot.slot())
+                    .index_mut(slot.slot())
                     .expect("accepted session vanished")
-                    .raw_fd()
+                    .arm_recv(&self.io, slot)
             });
-            self.io.recv_multi(&fd, slot.slot());
         }
         self.access(|ctx| {
             assert!(
@@ -286,8 +381,9 @@ impl<C: MessageConsumer> SessionManager<C> {
             .access(|ctx| ctx.socks.get())
             .map(SessionId::from)
             .ok_or_else(|| io::Error::other("session table full"))?;
-        self.io.recv_multi(&fd, slot.slot());
-        self.access(|ctx| ctx.socks.set(slot.slot(), Session::new(fd, true)));
+        let mut session = Session::new(fd, true);
+        session.arm_recv(&self.io, slot);
+        self.access(|ctx| ctx.socks.set(slot.slot(), session));
         Ok(slot)
     }
 
@@ -308,23 +404,173 @@ impl<C: MessageConsumer> SessionManager<C> {
                 log::debug!("recv completion for a closed session {:?}", slot);
                 return;
             };
-            match res {
-                Ok(data) if !data.is_empty() => {
-                    session.mux_mut().on_data(data, slot, &self.consumer)
-                }
-                Ok(_) => {
-                    session.close();
-                    session.mux_mut().on_end(None, slot, &self.consumer);
-                }
-                Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
-                    log::warn!("recv buffers exhausted on session {:?}", slot);
-                }
-                Err(e) => {
-                    let err = -e.raw_os_error().unwrap_or(libc::EIO);
-                    session.fail(err);
-                    session.mux_mut().on_end(Some(e), slot, &self.consumer);
-                }
-            }
+            session.on_recv(res, slot, &self.consumer);
+            ctx.release_if_unused(slot);
         });
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//  Tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    /// Records the end notification of every stream.
+    #[derive(Default)]
+    struct Ends(std::cell::RefCell<Vec<(StreamId, i32)>>);
+
+    impl MessageConsumer for Ends {
+        fn consume(&self, result: i32, addr: SessionAddr, buf: Option<&[u8]>) {
+            if buf.is_none() {
+                self.0.borrow_mut().push((addr.stream(), result));
+            }
+        }
+    }
+
+    fn ends(mgr: &SessionManager<Ends>) -> Vec<(StreamId, i32)> {
+        mgr.consumer.0.borrow().clone()
+    }
+
+    fn staged_put(mgr: &SessionManager<Ends>, addr: &SessionAddr) -> impl Future<Output = (io::Result<usize>, IoBuf)> {
+        let mut buf = crate::io::local_packet_buffer_pool().pop();
+        buf.mark_used(4);
+        mgr.put(buf, addr)
+    }
+
+    fn sessions<C: MessageConsumer>(mgr: &SessionManager<C>) -> Vec<SessionId> {
+        mgr.access(|ctx| ctx.socks.ids().map(SessionId::from).collect())
+    }
+
+    fn drive<C: MessageConsumer>(mgr: &SessionManager<C>, mut done: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if done() {
+                return;
+            }
+            mgr.enter(IOEnterIntent::Poll);
+            mgr.manage().expect("manage failed");
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        panic!("timeout driving the session manager");
+    }
+
+    /// Drives completions without submitting staged sends.
+    fn drive_recv<C: MessageConsumer>(mgr: &SessionManager<C>, mut done: impl FnMut() -> bool) {
+        for _ in 0..10_000 {
+            if done() {
+                return;
+            }
+            mgr.io().enter(IOEnterIntent::Poll);
+            mgr.manage().expect("manage failed");
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        panic!("timeout driving the session manager");
+    }
+
+    /// Server manager with one accepted session and its peer.
+    fn accepted() -> (SessionManager<Ends>, SessionId, TcpStream) {
+        let io = ThreadUring::new_with(|cfg| {
+            cfg.sq_entries = 8;
+            cfg.cq_entries = 8;
+        })
+        .expect("ring creation failed");
+        let listener = io.tcp_listener(([127, 0, 0, 1], 0)).expect("listen failed");
+        let addr = listener.local_addr().unwrap();
+        let mut mgr = SessionManager::new(io, Some(listener), 2, Ends::default());
+        mgr.start_accepting();
+        let client = TcpStream::connect(addr).expect("connect failed");
+        drive(&mgr, || sessions(&mgr).len() == 1);
+        let slt = sessions(&mgr)[0];
+        drive(&mgr, || {
+            mgr.access(|ctx| ctx.socks.index(slt.slot()).unwrap().recv.is_some())
+        });
+        assert_eq!(mgr.session_health(slt), Some(SessionHealth::Healthy));
+        (mgr, slt, client)
+    }
+
+    /// The peer ends the session while a send is staged but unsubmitted.
+    fn staged_send_on_end(reset: bool, errno: i32) {
+        let (mut mgr, slt, client) = accepted();
+        let addr = mgr.open_stream(slt).expect("stream table full");
+        {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let mut put = std::pin::pin!(staged_put(&mgr, &addr));
+            assert!(put.as_mut().poll(&mut cx).is_pending(), "send staged");
+            if reset {
+                socket2::SockRef::from(&client)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+            }
+            drop(client);
+            drive_recv(&mgr, || {
+                mgr.session_health(slt) != Some(SessionHealth::Healthy)
+            });
+            let std::task::Poll::Ready((res, _buf)) = put.as_mut().poll(&mut cx) else {
+                panic!("staged send outlives the session");
+            };
+            assert_eq!(res.unwrap_err().raw_os_error(), Some(errno));
+        }
+        assert_eq!(ends(&mgr), [(addr.stream(), -libc::ECONNRESET)]);
+        assert!(mgr.open_stream(slt).is_none(), "stream opened on an ended session");
+        assert_eq!(sessions(&mgr), [slt], "the open stream holds the session");
+        mgr.close_stream(&addr);
+        assert!(sessions(&mgr).is_empty());
+        assert_eq!(mgr.session_health(slt), None);
+    }
+
+    #[test]
+    fn test_closed_session_frees_its_slot() {
+        let (mgr, slt, client) = accepted();
+        drop(client);
+        drive(&mgr, || sessions(&mgr).is_empty());
+        assert_eq!(
+            mgr.session_health(slt),
+            None,
+            "freed slot answers to a stale id"
+        );
+    }
+
+    #[test]
+    fn test_eof_fails_a_staged_send() {
+        staged_send_on_end(false, libc::EPIPE);
+    }
+
+    #[test]
+    fn test_reset_fails_a_staged_send() {
+        staged_send_on_end(true, libc::ECONNRESET);
+    }
+
+    #[test]
+    fn test_send_error_reaches_every_stream() {
+        let (mut mgr, slt, _client) = accepted();
+        let idle = mgr.open_stream(slt).expect("stream table full");
+        let sending = mgr.open_stream(slt).expect("stream table full");
+        let fd = mgr.access(|ctx| ctx.socks.index(slt.slot()).unwrap().raw_fd());
+        assert_eq!(unsafe { libc::shutdown(fd, libc::SHUT_WR) }, 0);
+        {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let mut put = std::pin::pin!(staged_put(&mgr, &sending));
+            assert!(put.as_mut().poll(&mut cx).is_pending(), "send staged");
+            drive(&mgr, || ends(&mgr).len() == 2);
+            let std::task::Poll::Ready((res, _buf)) = put.as_mut().poll(&mut cx) else {
+                panic!("failed send still pending");
+            };
+            assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EPIPE));
+        }
+        assert_eq!(mgr.session_health(slt), Some(SessionHealth::Failed(-libc::EPIPE)));
+        let mut notified = ends(&mgr);
+        notified.sort_by_key(|(id, _)| id.to_wire());
+        assert_eq!(
+            notified,
+            [(idle.stream(), -libc::EPIPE), (sending.stream(), -libc::EPIPE)],
+            "the send error ends every stream"
+        );
+        mgr.close_stream(&idle);
+        assert_eq!(sessions(&mgr), [slt], "an open stream holds the session");
+        mgr.close_stream(&sending);
+        assert!(sessions(&mgr).is_empty());
     }
 }

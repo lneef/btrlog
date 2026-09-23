@@ -14,9 +14,6 @@ use super::slot_storage::{IndexSlotId, SMALL_SLOT_CAPACITY, SmallSlotStorage};
 use crate::types::packet::PacketHeader;
 
 const STREAM_COUNT: usize = SMALL_SLOT_CAPACITY;
-// one iovec entry per stream, bounded by UIO_MAXIOV
-const _: () = assert!(STREAM_COUNT <= 1024);
-/// Reported to the streams of a session whose peer closed cleanly.
 pub const STREAM_CLOSED: i32 = -libc::ECONNRESET;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -108,15 +105,6 @@ impl StreamSlotStore {
         closed.expect("close of an unopened stream");
     }
 
-    /// Closes a stream with nothing staged. False when it sends or already went away.
-    fn close_if_idle(&self, idx: StreamId) -> bool {
-        let idle = matches!(self.slot_at(idx), Some(slot) if slot.buf.is_none());
-        if idle {
-            self.close_stream(idx);
-        }
-        idle
-    }
-
     fn open_streams(&self) -> usize {
         self.access(|slots| slots.occupied())
     }
@@ -198,6 +186,7 @@ impl Drop for StreamSendFuture {
 
 /// Sink for the messages of every session of one `SessionManager`.
 /// `consume` runs inside the completion loop and must not re-enter the manager.
+/// A negative `result` without `buf` ends the stream. Its owner then calls `close_stream` once.
 pub trait MessageConsumer {
     fn consume(&self, result: i32, addr: SessionAddr, buf: Option<&[u8]>);
 }
@@ -261,10 +250,8 @@ impl<C: MessageConsumer> StreamConsumer for StreamMultiplexer<'_, C> {
             len += 1;
         }
         for &id in &ids[..len] {
-            if self.slots.close_if_idle(id) {
-                self.consumer
-                    .consume(err, SessionAddr::new(self.session, id), None);
-            }
+            self.consumer
+                .consume(err, SessionAddr::new(self.session, id), None);
         }
     }
 }
@@ -305,7 +292,7 @@ impl StreamManager {
         }
     }
 
-    pub fn open_streams(&self) -> usize {
+    pub fn ref_cnt(&self) -> usize {
         self.slots.open_streams() + (self.state == Kernel) as usize
     }
 
@@ -313,9 +300,8 @@ impl StreamManager {
         self.slots.open_stream()
     }
 
-    pub fn close_stream(&mut self, idx: StreamId) -> usize {
+    pub fn close_stream(&mut self, idx: StreamId) {
         self.slots.close_stream(idx);
-        self.slots.open_streams()
     }
 
     pub(crate) fn on_data<C: MessageConsumer>(
@@ -338,7 +324,6 @@ impl StreamManager {
         self.framer.on_end(err, &mut mux);
     }
 
-    /// Stages a send, handing the buffer back when the stream is no longer open.
     pub(crate) fn stage(
         &mut self,
         buf: IoBuf,
@@ -346,19 +331,11 @@ impl StreamManager {
     ) -> Result<(StreamSendFuture, bool), IoBuf> {
         assert!(self.head < STREAM_COUNT, "iovec ring is full");
         assert!(buf.used_bytes() > 0, "staging an empty send");
-        debug_assert!(
-            !self.stream_order[..self.head].contains(&idx),
-            "stream staged twice within one iovec run"
-        );
 
         let iovec_item = libc::iovec {
             iov_base: unsafe { buf.type_erased_ptr() } as *mut c_void,
             iov_len: buf.used_bytes(),
         };
-        assert!(
-            !iovec_item.iov_base.is_null(),
-            "staging an already released buffer"
-        );
 
         let Some(slot) = self.slots.slot_at_mut(idx) else {
             return Err(buf);
@@ -391,12 +368,13 @@ impl StreamManager {
         &self.msghdr
     }
 
-    pub fn fail(&mut self, err: i32) -> bool {
+    /// Fails every staged send the kernel does not hold.
+    pub fn fail_queued(&mut self, err: i32) {
         assert!(err < 0, "errors are stored as -errno");
-        assert_eq!(
+        assert_ne!(
             self.state,
             StreamState::Kernel,
-            "send failure without a send in flight"
+            "failing sends the kernel still reads"
         );
         for &idx in &self.stream_order[..self.head] {
             let waker = {
@@ -414,11 +392,19 @@ impl StreamManager {
         }
         self.head = 0;
         self.state = StreamState::Idle;
-        false
     }
 
-    pub fn reap(&mut self, mut sent: usize) -> bool {
+    /// Ends the send in flight. True when sends are left to submit.
+    pub fn reap(&mut self, res: Result<usize, i32>) -> bool {
         assert_eq!(self.state, StreamState::Kernel);
+        let mut sent = match res {
+            Ok(sent) => sent,
+            Err(err) => {
+                self.state = StreamState::Queued;
+                self.fail_queued(err);
+                return false;
+            }
+        };
         assert!(sent > 0, "send completed without transferring anything");
         let mut last = 0usize;
         for _ in 0..self.head {
@@ -508,6 +494,34 @@ mod tests {
     }
 
     #[test]
+    fn test_reopened_stream_starts_clean() {
+        let mut mux = StreamManager::new(false);
+        let stale = mux.open_stream().unwrap();
+        mux.close_stream(stale);
+        assert_eq!(mux.ref_cnt(), 0);
+        let id = mux.open_stream().unwrap();
+        assert_ne!(id, stale);
+        assert_eq!(mux.ref_cnt(), 1);
+
+        let mut buf = crate::io::local_packet_buffer_pool().pop();
+        buf.mark_used(4);
+        let buf = mux.stage(buf, stale).err().expect("staged on a closed stream");
+        let (fut, queue) = mux.stage(buf, id).unwrap();
+        assert!(queue);
+        mux.prepare();
+        assert!(!mux.reap(Ok(4)));
+        assert_eq!(mux.state(), StreamState::Idle);
+
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        let Poll::Ready((res, _buf)) = std::pin::pin!(fut).poll(&mut cx) else {
+            panic!("completed send still pending");
+        };
+        assert_eq!(res.unwrap(), 4);
+        mux.close_stream(id);
+        assert_eq!(mux.ref_cnt(), 0);
+    }
+
+    #[test]
     fn test_wire_index_out_of_range_is_rejected() {
         assert!(StreamId::from_wire(wire((STREAM_COUNT - 1) as u16, 1)).is_some());
         assert!(StreamId::from_wire(wire(STREAM_COUNT as u16, 1)).is_none());
@@ -548,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn test_end_closes_idle_streams() {
+    fn test_end_notifies_open_streams() {
         let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
         let slots = StreamSlotStore::new();
         let rec = Rec(seen.clone());
@@ -560,7 +574,7 @@ mod tests {
         assert_eq!(slots.open_streams(), 2);
 
         mux.on_end(None);
-        assert_eq!(slots.open_streams(), 0, "idle streams outlive the session");
+        assert_eq!(slots.open_streams(), 2, "the owner closes its streams");
         assert_eq!(seen.borrow().len(), 4);
         assert_eq!(
             seen.borrow()[2..],
@@ -569,21 +583,13 @@ mod tests {
                 StreamId::from_wire(b).unwrap()
             ]
         );
-        // the closed index is free again under a new generation
-        let reopened = wire(3, 6);
-        assert!(slots.slot_at(StreamId::from_wire(a).unwrap()).is_none());
-        assert!(
-            slots
-                .stream_or_insert(
-                    StreamId::from_wire(reopened).unwrap(),
-                    StreamContext::default
-                )
-                .is_some()
-        );
+        slots.close_stream(StreamId::from_wire(a).unwrap());
+        slots.close_stream(StreamId::from_wire(b).unwrap());
+        assert_eq!(slots.open_streams(), 0);
     }
 
     #[test]
-    fn test_end_leaves_a_sending_stream_to_its_sender() {
+    fn test_end_notifies_a_sending_stream() {
         let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
         let rec = Rec(seen.clone());
         let mut mux = StreamManager::new(false);
@@ -593,22 +599,45 @@ mod tests {
         let (_fut, _) = mux.stage(buf, id).unwrap();
 
         mux.on_end(None, SessionId::default(), &rec);
-        assert_eq!(mux.open_streams(), 1, "a staged send lost its stream");
-        assert!(seen.borrow().is_empty(), "sender notified twice");
+        assert_eq!(mux.slots.open_streams(), 1, "a staged send lost its stream");
+        assert_eq!(seen.borrow().as_slice(), [id]);
         // the sender is woken, the caller closes once it has reaped the buffer
         mux.fail_queued(STREAM_CLOSED);
-        assert_eq!(mux.open_streams(), 1);
+        assert_eq!(mux.slots.open_streams(), 1);
+    }
+
+    #[test]
+    fn test_failed_send_wakes_every_staged_stream() {
+        let mut mux = StreamManager::new(false);
+        let ids = [mux.open_stream().unwrap(), mux.open_stream().unwrap()];
+        let futs = ids.map(|id| {
+            let mut buf = crate::io::local_packet_buffer_pool().pop();
+            buf.mark_used(4);
+            mux.stage(buf, id).unwrap().0
+        });
+        mux.prepare();
+        assert_eq!(mux.ref_cnt(), 3, "two streams and the send in flight");
+        assert!(!mux.reap(Err(-libc::ECONNRESET)));
+        assert_eq!(mux.state(), StreamState::Idle);
+        assert_eq!(mux.ref_cnt(), 2);
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        for fut in futs {
+            let Poll::Ready((res, _buf)) = std::pin::pin!(fut).poll(&mut cx) else {
+                panic!("failed send still pending");
+            };
+            assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::ECONNRESET));
+        }
     }
 
     #[test]
     fn test_open_stream_count() {
         let mut mux = StreamManager::new(false);
-        assert_eq!(mux.open_streams(), 0);
+        assert_eq!(mux.slots.open_streams(), 0);
         let first = mux.open_stream().unwrap();
         mux.open_stream().unwrap();
         mux.open_stream().unwrap();
-        assert_eq!(mux.open_streams(), 3);
-        assert_eq!(mux.close_stream(first), 2);
-        assert_eq!(mux.open_streams(), 2);
+        assert_eq!(mux.slots.open_streams(), 3);
+        mux.close_stream(first);
+        assert_eq!(mux.slots.open_streams(), 2);
     }
 }

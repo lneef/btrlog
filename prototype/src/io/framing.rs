@@ -20,6 +20,12 @@ pub struct MessageFramer {
     dead: bool,
 }
 
+impl Default for MessageFramer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MessageFramer {
     pub fn new() -> Self {
         Self {
@@ -29,30 +35,34 @@ impl MessageFramer {
         }
     }
 
-    fn frame_len(bytes: &[u8]) -> Option<io::Result<usize>> {
+    /// None until the header is complete. Aborts on a malformed frame.
+    fn frame_len(bytes: &[u8]) -> Option<usize> {
         let len = match PacketHeader::peek(bytes)? {
             Ok(hdr) => PacketHeader::WIRE_SIZE + hdr.fragment_len as usize,
-            Err(e) => return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
+            Err(e) => Self::abort(format_args!("undecodable header: {:?}", e)),
         };
         if len > MAX_PACKET_SIZE {
-            return Some(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "frame exceeds the maximum packet size",
-            )));
+            Self::abort(format_args!(
+                "frame of {} bytes exceeds the maximum packet size",
+                len
+            ));
         }
-        Some(Ok(len))
+        Some(len)
+    }
+
+    fn abort(reason: std::fmt::Arguments) -> ! {
+        eprintln!("framing error, aborting: {}", reason);
+        std::process::abort()
     }
 
     fn fill_partial<'a, C: StreamConsumer>(
         &mut self,
         data: &'a [u8],
         consumer: &mut C,
-    ) -> io::Result<&'a [u8]> {
+    ) -> &'a [u8] {
         let partial = self.partial.as_mut().expect("no partial message");
-        let need = match Self::frame_len(&partial.buf.as_slice()[..partial.filled]) {
-            None => PacketHeader::WIRE_SIZE,
-            Some(len) => len?,
-        };
+        let need = Self::frame_len(&partial.buf.as_slice()[..partial.filled])
+            .unwrap_or(PacketHeader::WIRE_SIZE);
         assert!(
             partial.filled < need,
             "a complete frame was left in the scratch buffer"
@@ -60,26 +70,28 @@ impl MessageFramer {
         let n = (need - partial.filled).min(data.len());
         partial.buf.as_mut_slice()[partial.filled..partial.filled + n].copy_from_slice(&data[..n]);
         partial.filled += n;
-        if let Some(len) = Self::frame_len(&partial.buf.as_slice()[..partial.filled]) {
-            let len = len?;
-            if partial.filled == len {
-                // scratch returns to the pool after the call
-                let partial = self.partial.take().unwrap();
-                consumer.on_message(&partial.buf.as_slice()[..len]);
-            }
+        if let Some(len) = Self::frame_len(&partial.buf.as_slice()[..partial.filled])
+            && partial.filled == len
+        {
+            // scratch returns to the pool after the call
+            let partial = self.partial.take().unwrap();
+            consumer.on_message(&partial.buf.as_slice()[..len]);
         }
-        Ok(&data[n..])
+        &data[n..]
     }
 
-    fn feed<C: StreamConsumer>(&mut self, mut data: &[u8], consumer: &mut C) -> io::Result<()> {
+    pub fn on_data<C: StreamConsumer>(&mut self, mut data: &[u8], consumer: &mut C) {
+        if self.dead {
+            return;
+        }
         while !data.is_empty() {
             if self.partial.is_some() {
                 let pending = data.len();
-                data = self.fill_partial(data, consumer)?;
+                data = self.fill_partial(data, consumer);
                 assert!(data.len() < pending, "framer consumed no input");
                 continue;
             }
-            match Self::frame_len(data).transpose()? {
+            match Self::frame_len(data) {
                 Some(len) if len <= data.len() => {
                     consumer.on_message(&data[..len]);
                     data = &data[len..];
@@ -93,18 +105,6 @@ impl MessageFramer {
                     self.partial = Some(Partial { buf, filled: 0 });
                 }
             }
-        }
-        Ok(())
-    }
-
-    pub fn on_data<C: StreamConsumer>(&mut self, data: &[u8], consumer: &mut C) {
-        if self.dead {
-            return;
-        }
-        if let Err(e) = self.feed(data, consumer) {
-            self.dead = true;
-            self.partial = None;
-            consumer.on_end(Some(e));
         }
     }
 
@@ -239,23 +239,6 @@ mod tests {
             f.on_data(std::slice::from_ref(byte), &mut c);
         }
         assert_eq!(rec.borrow().msgs, [a]);
-    }
-
-    #[test]
-    fn test_oversized_frame_ends_stream() {
-        let (mut f, mut c, rec) = framer();
-        let mut hdr = frame(1, b"");
-        hdr[PacketHeader::WIRE_SIZE - 4..].copy_from_slice(&(MAX_PACKET_SIZE as u32).to_le_bytes());
-        f.on_data(&hdr[..4], &mut c);
-        f.on_data(&hdr[4..], &mut c);
-        assert_eq!(
-            rec.borrow().end.as_ref().unwrap().as_ref().unwrap().kind(),
-            io::ErrorKind::InvalidData
-        );
-        // the stream is dead: nothing else gets through
-        f.on_data(&frame(2, b"late"), &mut c);
-        f.on_end(None, &mut c);
-        assert!(rec.borrow().msgs.is_empty());
     }
 
     #[test]

@@ -1,8 +1,7 @@
 use io_uring::types::FsyncFlags;
 use io_uring::{IoUring, cqueue, opcode, squeue, types};
 #[cfg(feature = "trace-requests")]
-use reqtrace::CycleMeasurement;
-use reqtrace::FrequencyScale;
+use reqtrace::{CycleMeasurement, FrequencyScale};
 use socket2::{Domain, Protocol, SockAddr, Socket, TcpKeepalive, Type};
 use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
@@ -35,9 +34,13 @@ pub struct PendingOp {
     waker: Option<Waker>,
     pub result: Option<i32>,
     session: Option<SessionOp>,
+    cancelled: bool,
     #[cfg(feature = "trace-requests")]
     duration_trace: u64,
 }
+
+/// Result and buffer of a completed op, with its traced cycles.
+pub(super) type TakenResult = ((io::Result<i32>, Option<IoBuf>), u64);
 
 pub(super) enum OpStage {
     Unsubmitted,
@@ -55,6 +58,7 @@ impl PendingOp {
             waker: None,
             result: None,
             session: None,
+            cancelled: false,
             #[cfg(feature = "trace-requests")]
             duration_trace: 0,
         }
@@ -83,7 +87,7 @@ impl PendingOp {
         if current_epoch > self.epoch {
             return OpStage::Submitted;
         }
-        return OpStage::Unsubmitted;
+        OpStage::Unsubmitted
     }
 }
 
@@ -701,7 +705,7 @@ impl UringContext {
         self.stats.last_known_cq_batch_size = len;
         #[cfg(feature = "trace-requests")]
         let harvest_start_time = CycleMeasurement::now();
-        while let Some(cqe) = cq.next() {
+        for cqe in cq.by_ref() {
             let user_data = cqe.user_data();
             // check whether it's an internal completion
             if std::hint::unlikely(user_data == Self::EVENTFD_USER_DATA) {
@@ -735,12 +739,15 @@ impl UringContext {
                         if more {
                             continue;
                         }
-                        if live {
+                        if live && !pending_op.cancelled {
                             self.rearm.push(op_id);
-                        } else {
-                            *pending_op = PendingOp::empty(self.stats.submission_epoch);
-                            self.free_slots.push(op_id.slot());
+                            continue;
                         }
+                        if live {
+                            self.session_done.push_back(SessionEvent::cancelled(kind));
+                        }
+                        *pending_op = PendingOp::empty(self.stats.submission_epoch);
+                        self.free_slots.push(op_id.slot());
                         continue;
                     }
                     // Op ID matches - store the result
@@ -801,7 +808,7 @@ impl UringContext {
             }
         }
         let _x = self.am_in_completion.replace(false);
-        debug_assert_eq!(_x, true);
+        debug_assert!(_x);
         drop(cq);
         self.arm_session_ops();
         Ok(len)
@@ -810,10 +817,10 @@ impl UringContext {
     #[inline]
     pub fn poll_completions(&mut self) -> io::Result<usize> {
         self.poll_completions_callback(|_opid, result, opref| {
-            if result > 0 {
-                if let Some(buf) = opref.buffer_ref() {
-                    buf.mark_used(result as usize);
-                }
+            if result > 0
+                && let Some(buf) = opref.buffer_ref()
+            {
+                buf.mark_used(result as usize);
             }
             OpCompletionAction::TryWake
         })
@@ -834,6 +841,7 @@ impl UringContext {
             waker: None,
             result: None,
             session: None,
+            cancelled: false,
             #[cfg(feature = "trace-requests")]
             duration_trace: CycleMeasurement::now(),
         };
@@ -920,15 +928,11 @@ impl UringContext {
             pending_op.set_waker(waker);
             return true;
         }
-        return false;
+        false
     }
 
     #[inline]
-    pub(super) fn take_result(
-        &mut self,
-        op_id: OpId,
-        waker: &Waker,
-    ) -> Poll<((io::Result<i32>, Option<IoBuf>), u64)> {
+    pub(super) fn take_result(&mut self, op_id: OpId, waker: &Waker) -> Poll<TakenResult> {
         let slot_idx = op_id.slot() as usize;
 
         if let Some(pending_op) = self.slots.get_mut(slot_idx) {
@@ -936,10 +940,7 @@ impl UringContext {
             if pending_op.uid != op_id.uid() {
                 return Poll::Ready((
                     (
-                        Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "Operation was cancelled or replaced",
-                        )),
+                        Err(io::Error::other("Operation was cancelled or replaced")),
                         None,
                     ),
                     0,
@@ -977,7 +978,7 @@ impl UringContext {
         } else {
             Poll::Ready((
                 (
-                    Err(io::Error::new(io::ErrorKind::Other, "Invalid slot index")),
+                    Err(io::Error::other("Invalid slot index")),
                     None,
                 ),
                 0,
@@ -1064,12 +1065,46 @@ struct SessionEvent {
     cqe: RawCqe,
 }
 
+impl SessionEvent {
+    /// Stands in for the kernel's -ECANCELED of an op that is not in flight.
+    fn cancelled(kind: SessionOp) -> Self {
+        Self {
+            kind,
+            cqe: RawCqe {
+                result: -libc::ECANCELED,
+                flags: 0,
+            },
+        }
+    }
+}
+
 impl UringContext {
     fn submit_session_op(&mut self, kind: SessionOp) -> OpId {
         let (op_id, opref) = self.register_new_pending_op().expect("No slots available");
         opref.session = Some(kind);
         self.rearm.push(op_id);
         op_id
+    }
+
+    /// Ends a multishot op with one -ECANCELED completion. No-op once the op ended.
+    fn cancel_session_op(&mut self, op_id: OpId) {
+        let pending_op = &mut self.slots[op_id.slot() as usize];
+        if pending_op.uid != op_id.uid() || pending_op.cancelled {
+            return;
+        }
+        let kind = pending_op.session.expect("not a multishot op");
+        pending_op.cancelled = true;
+        if let Some(pos) = self.rearm.iter().position(|&id| id == op_id) {
+            self.rearm.swap_remove(pos);
+            *pending_op = PendingOp::empty(self.stats.submission_epoch);
+            self.free_slots.push(op_id.slot());
+            self.session_done.push_back(SessionEvent::cancelled(kind));
+            return;
+        }
+        let sqe = opcode::AsyncCancel::new(op_id.into_user_data())
+            .build()
+            .user_data(Self::CANCEL_USER_DATA);
+        self.enqueue_retry_once(sqe).expect("SQ full after a wait");
     }
 
     fn arm_session_ops(&mut self) {
@@ -1160,12 +1195,17 @@ impl ThreadUring {
         self.access(|ctx| ctx.submit_session_op(kind));
     }
 
-    pub fn recv_multi(&self, sock: &impl AsRawFd, slot: IndexSlotId) {
+    pub fn recv_multi(&self, sock: &impl AsRawFd, slot: IndexSlotId) -> OpId {
         let kind = SessionOp::Recv {
             fd: sock.as_raw_fd(),
             slot,
         };
-        self.access(|ctx| ctx.submit_session_op(kind));
+        self.access(|ctx| ctx.submit_session_op(kind))
+    }
+
+    /// The op ends with -ECANCELED on a later `poll_completion`.
+    pub fn cancel_session_op(&self, op_id: OpId) {
+        self.access(|ctx| ctx.cancel_session_op(op_id));
     }
 
     /// Submits the sendmsg on the next `enter`; the completion arrives via `on_sent`.
@@ -1218,7 +1258,7 @@ impl ThreadUring {
 
     #[inline]
     pub fn last_known_cq_batch_size(&self) -> usize {
-        self.access(|uring| uring.stats.last_known_cq_batch_size) as usize
+        self.access(|uring| uring.stats.last_known_cq_batch_size)
     }
 
     pub fn enter(&self, intent: IOEnterIntent) {
@@ -1226,7 +1266,7 @@ impl ThreadUring {
     }
 
     pub fn unpark(&self) {
-        let _ = self.access(|uring| uring.request_unpark());
+        self.access(|uring| uring.request_unpark());
     }
 
     #[allow(dead_code)]
@@ -1289,6 +1329,7 @@ pub(crate) enum RequestTracingType {
 }
 
 impl RequestTracingType {
+    #[cfg(feature = "trace-requests")]
     #[inline]
     fn do_log(&self, cycles: u64) -> Option<f64> {
         match self {
@@ -1481,7 +1522,7 @@ impl Future for PendingSimpleOp {
                 .take_result(self.op_id, cx.waker())
                 .map(|res| log_if_slow_completion(self.trace_type, res))
                 .map(|(result, _buf)| {
-                    debug_assert!(matches!(_buf, None));
+                    debug_assert!(_buf.is_none());
                     result
                 })
         })
@@ -1727,7 +1768,7 @@ impl ThreadUring {
             Ok(len) => {
                 buf.mark_used(len);
                 let ip = IpAddr::V4(Ipv4Addr::from(u32::from_be(out_addr.sin_addr.s_addr)));
-                let from = ((ip, u16::from_be(out_addr.sin_port))).into();
+                let from = (ip, u16::from_be(out_addr.sin_port)).into();
                 (Ok((len, from)), buf)
             }
             Err(e) => (Err(e), buf),
@@ -1913,31 +1954,6 @@ mod tests {
     use crate::runtime::*;
     use std::time::Instant;
 
-    /// Non-blocking socket using io_uring
-    struct UringSocket {
-        socket: Socket,
-        _context: ThreadUring,
-    }
-
-    impl UringSocket {
-        fn new(_context: ThreadUring) -> io::Result<Self> {
-            let socket = Socket::new(Domain::IPV4, Type::STREAM, None)?;
-            socket.set_nonblocking(true)?;
-
-            Ok(Self { socket, _context })
-        }
-
-        fn bind(&self, addr: &SocketAddr) -> io::Result<()> {
-            self.socket.set_reuse_address(true)?;
-            self.socket.set_reuse_port(true)?;
-            self.socket.bind(&(*addr).into())
-        }
-
-        fn listen(&self, backlog: i32) -> io::Result<()> {
-            self.socket.listen(backlog)
-        }
-    }
-
     #[test]
     fn test_sleep() {
         let uring = ThreadUring::new_with(|cfg| {
@@ -1956,7 +1972,7 @@ mod tests {
         let t_start = Instant::now();
         c_start.start_measurement();
         let mut timeout = std::pin::pin!(uring.sleep(t));
-        while let Poll::Pending = timeout.as_mut().poll(&mut ctx) {
+        while timeout.as_mut().poll(&mut ctx).is_pending() {
             uring
                 .access(|c| c.enter(IOEnterIntent::Submit))
                 .expect("error during uring submit");
@@ -2049,7 +2065,7 @@ mod tests {
         let test_file = "/dev/sda";
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .open(&test_file)
+            .open(test_file)
             .expect("Failed to open test file");
         let fd = file.as_raw_fd();
 
@@ -2347,6 +2363,48 @@ mod multishot_tests {
         );
         assert!(received.data.iter().all(|d| d.iter().all(|&b| b == 7)));
         assert_eq!(io.current_outstanding(), 2, "recv is armed again");
+    }
+
+    fn assert_cancelled(owner: &Owner) {
+        let received = owner.received.borrow();
+        let err = received.end.as_ref().unwrap().as_ref().expect("recv ended cleanly");
+        assert_eq!(err.raw_os_error(), Some(libc::ECANCELED));
+    }
+
+    #[test]
+    fn test_recv_cancel_armed() {
+        let io = small_ring(512);
+        let (listener, addr) = listen(&io);
+        let owner = Owner::default();
+        io.accept_multi(&listener);
+        submit(&io);
+        let (_client, conn) = accepted_pair(&io, addr, &owner);
+        let op = io.recv_multi(&conn, slot());
+        submit(&io);
+        assert_eq!(io.current_outstanding(), 2, "recv armed");
+        io.cancel_session_op(op);
+        drive(&io, &owner, || owner.ended());
+        assert_cancelled(&owner);
+        drive(&io, &owner, || io.current_outstanding() == 1);
+        io.cancel_session_op(op);
+        submit(&io);
+        assert_eq!(io.current_outstanding(), 1, "cancel of an ended op submits nothing");
+    }
+
+    #[test]
+    fn test_recv_cancel_unsubmitted() {
+        let io = small_ring(512);
+        let (listener, addr) = listen(&io);
+        let owner = Owner::default();
+        io.accept_multi(&listener);
+        submit(&io);
+        let (_client, conn) = accepted_pair(&io, addr, &owner);
+        let op = io.recv_multi(&conn, slot());
+        io.cancel_session_op(op);
+        owner.poll(&io);
+        assert_cancelled(&owner);
+        submit(&io);
+        assert_eq!(io.current_outstanding(), 1, "the recv was never armed");
     }
 
     #[test]
