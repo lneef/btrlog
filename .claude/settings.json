@@ -1,0 +1,13 @@
+{
+  "worktree": {
+    "baseRef": "head"
+  }, 
+  "sandbox": {
+      "filesystem": {  
+      "denyRead": ["~/.aws", "~/.ssh", "~/.claude.json"]
+    }
+  },
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  }
+}

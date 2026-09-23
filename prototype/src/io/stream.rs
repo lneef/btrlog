@@ -29,12 +29,20 @@ struct StreamContext {
     waker: Option<Waker>,
     err: i32,
     woken: bool,
+    /// puts waiting for the staged send to be released
+    waiters: Vec<Waker>,
 }
 
 impl StreamContext {
     fn complete(&mut self) -> Option<Waker> {
         self.woken = true;
         self.waker.take()
+    }
+
+    fn wake_waiters(&mut self) {
+        for waker in self.waiters.drain(..) {
+            waker.wake();
+        }
     }
 }
 
@@ -102,7 +110,7 @@ impl StreamSlotStore {
 
     fn close_stream(&self, idx: StreamId) {
         let closed = self.access(|slots| slots.put(idx.slot()));
-        closed.expect("close of an unopened stream");
+        closed.expect("close of an unopened stream").wake_waiters();
     }
 
     fn open_streams(&self) -> usize {
@@ -122,6 +130,7 @@ impl StreamSlotStore {
             .expect("release without a staged send")
             .used_bytes();
         slot.err = 0;
+        slot.wake_waiters();
         (
             buf,
             if err == 0 {
@@ -302,6 +311,18 @@ impl StreamManager {
 
     pub fn close_stream(&mut self, idx: StreamId) {
         self.slots.close_stream(idx);
+    }
+
+    /// True while the stream holds a staged send; `waker` runs once it is released.
+    pub(crate) fn wait_if_busy(&mut self, idx: StreamId, waker: &Waker) -> bool {
+        let Some(slot) = self.slots.slot_at_mut(idx) else {
+            return false;
+        };
+        let busy = slot.buf.is_some();
+        if busy {
+            slot.waiters.push(waker.clone());
+        }
+        busy
     }
 
     pub(crate) fn on_data<C: MessageConsumer>(

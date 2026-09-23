@@ -1143,12 +1143,25 @@ impl UringContext {
 
     pub fn poll_completion(
         &mut self,
+        on_accept: impl FnMut(io::Result<OwnedFd>),
+        on_recv: impl FnMut(IndexSlotId, io::Result<&[u8]>),
+        on_sent: impl FnMut(IndexSlotId, io::Result<usize>),
+    ) -> io::Result<usize> {
+        let harvested = self.poll_completions()?;
+        self.drain_sessions(on_accept, on_recv, on_sent);
+        Ok(harvested)
+    }
+
+    /// Hands out the session events collected so far without touching the CQ.
+    pub fn drain_sessions(
+        &mut self,
         mut on_accept: impl FnMut(io::Result<OwnedFd>),
         mut on_recv: impl FnMut(IndexSlotId, io::Result<&[u8]>),
         mut on_sent: impl FnMut(IndexSlotId, io::Result<usize>),
-    ) -> io::Result<usize> {
-        let harvested = self.poll_completions()?;
+    ) -> usize {
+        let mut drained = 0;
         while let Some(ev) = self.session_done.pop_front() {
+            drained += 1;
             let RawCqe { result, flags } = ev.cqe;
             match ev.kind {
                 SessionOp::Accept { .. } => on_accept(if result >= 0 {
@@ -1183,7 +1196,7 @@ impl UringContext {
                 ),
             }
         }
-        Ok(harvested)
+        drained
     }
 }
 
@@ -1225,6 +1238,15 @@ impl ThreadUring {
         on_sent: impl FnMut(IndexSlotId, io::Result<usize>),
     ) -> io::Result<usize> {
         self.access(|ctx| ctx.poll_completion(on_accept, on_recv, on_sent))
+    }
+
+    pub fn drain_sessions(
+        &self,
+        on_accept: impl FnMut(io::Result<OwnedFd>),
+        on_recv: impl FnMut(IndexSlotId, io::Result<&[u8]>),
+        on_sent: impl FnMut(IndexSlotId, io::Result<usize>),
+    ) -> usize {
+        self.access(|ctx| ctx.drain_sessions(on_accept, on_recv, on_sent))
     }
 }
 
@@ -1912,6 +1934,8 @@ impl ThreadUring {
     const KEEPALIVE_IDLE: Duration = Duration::from_secs(5);
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
     const KEEPALIVE_RETRIES: u32 = 3;
+    /// Bounds detection while data is unacked, where keepalive does not probe.
+    const USER_TIMEOUT: Duration = Duration::from_secs(20);
 
     pub async fn tcp_connect(&self, addr: impl Into<SocketAddr>) -> io::Result<OwnedFd> {
         let addr = addr.into();
@@ -1921,6 +1945,7 @@ impl ThreadUring {
             .with_interval(Self::KEEPALIVE_INTERVAL)
             .with_retries(Self::KEEPALIVE_RETRIES);
         socket.set_tcp_keepalive(&keepalive)?;
+        socket.set_tcp_user_timeout(Some(Self::USER_TIMEOUT))?;
         socket.set_tcp_nodelay(true)?;
         socket.set_tcp_congestion(b"bbr")?;
         let sockaddr = SockAddr::from(addr);
