@@ -171,8 +171,6 @@ pub struct TcpStreams {
     inflight: RefCell<Vec<(SessionAddr, u64, SocketAddr)>>,
     /// ended streams their journal has not closed yet
     ended: RefCell<Vec<SessionAddr>>,
-    /// streams with a detached put in flight
-    busy: RefCell<Vec<SessionAddr>>,
 }
 
 impl TcpStreams {
@@ -180,7 +178,6 @@ impl TcpStreams {
         Rc::new(Self {
             inflight: RefCell::new(Vec::with_capacity(cap)),
             ended: RefCell::new(Vec::with_capacity(cap)),
-            busy: RefCell::new(Vec::with_capacity(cap)),
         })
     }
 
@@ -201,23 +198,9 @@ impl TcpStreams {
         self.inflight.borrow_mut().retain(|&(_, id, _)| id != msg_id);
     }
 
-    fn is_busy(&self, addr: &SessionAddr) -> bool {
-        self.busy.borrow().contains(addr)
-    }
-
-    fn set_busy(&self, addr: SessionAddr, busy: bool) {
-        let mut streams = self.busy.borrow_mut();
-        if busy {
-            streams.push(addr);
-        } else {
-            let pos = streams.iter().position(|a| *a == addr).expect("untracked stream put");
-            streams.swap_remove(pos);
-        }
-    }
-
-    /// Removes the ended streams `owned` claims. Streams with a put in flight stay.
+    /// Removes the ended streams `owned` claims.
     pub fn take_ended(&self, mut owned: impl FnMut(&SessionAddr) -> bool) {
-        self.ended.borrow_mut().retain(|addr| self.is_busy(addr) || !owned(addr));
+        self.ended.borrow_mut().retain(|addr| !owned(addr));
     }
 }
 
@@ -352,10 +335,10 @@ impl JournalQuorumDriver {
 
     /// Sends `req` once on every replica's stream and waits for `majority` valid responses.
     /// `remotes[i]` is replica i and its stream, None when the replica is unavailable.
-    /// A replica whose previous put is still in flight counts as failed.
+    /// A replica whose previous send is still staged counts as failed.
     pub async fn tcp_quorum_send<CheckResponse>(
         self: &Rc<Self>,
-        sessions: &Rc<SessionManager<ClientSink>>,
+        sessions: &SessionManager<ClientSink>,
         req: JournalRequest,
         remotes: &ForCluster<(SocketAddr, Option<SessionAddr>)>,
         majority: usize,
@@ -367,7 +350,7 @@ impl JournalQuorumDriver {
     {
         let mut quorum = PendingQuorum::new(remotes.len(), majority, remotes.iter().map(|(addr, _)| *addr));
         for (addr, stream) in remotes.iter() {
-            if stream.is_none_or(|stream| self.tcp.is_busy(&stream)) {
+            if stream.is_none_or(|stream| sessions.stream_busy(&stream)) {
                 quorum.fail(addr.ip());
             }
         }
@@ -386,7 +369,7 @@ impl JournalQuorumDriver {
             },
             request: req,
         };
-        let sendable = |stream: &Option<SessionAddr>| stream.is_some_and(|stream| !self.tcp.is_busy(&stream));
+        let sendable = |stream: &Option<SessionAddr>| stream.is_some_and(|stream| !sessions.stream_busy(&stream));
         let available = remotes.iter().filter(|(_, stream)| sendable(stream)).count();
         let mut bufs = Self::encode_many(&self.bufpool, available, |dst| packet.encode_framed(dst))
             .map_err(|_| RetryRequestError::MessageEncoding)?;
@@ -404,16 +387,10 @@ impl JournalQuorumDriver {
             header.stream_id = addr.stream().to_wire();
             header.encode_into(buf.data_mut()).map_err(|_| RetryRequestError::MessageEncoding)?;
             self.tcp.set_inflight(addr, msg_id, *peer);
-            self.tcp.set_busy(addr, true);
-            let (sessions, tcp, pending, peer) = (sessions.clone(), self.tcp.clone(), self.pending.clone(), *peer);
-            crate::client::client_exec().spawn_task(async move {
-                let (res, _buf) = sessions.put(buf, &addr).await;
-                tcp.set_busy(addr, false);
-                if let Err(e) = res {
-                    log::warn!("send to {} failed: {}", peer, e);
-                    pending.on_replica_failed(msg_id, peer.ip());
-                }
-            });
+            if let Err((e, _buf)) = sessions.send(buf, &addr) {
+                log::warn!("send to {} failed: {}", peer, e);
+                stream.fail(peer.ip());
+            }
         }
         let t_start = Instant::now();
         let t_recv_start = t_start;

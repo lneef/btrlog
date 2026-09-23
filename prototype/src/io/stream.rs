@@ -29,6 +29,8 @@ struct StreamContext {
     waker: Option<Waker>,
     err: i32,
     woken: bool,
+    /// no future owns the staged send
+    detached: bool,
     /// puts waiting for the staged send to be released
     waiters: Vec<Waker>,
 }
@@ -37,6 +39,18 @@ impl StreamContext {
     fn complete(&mut self) -> Option<Waker> {
         self.woken = true;
         self.waker.take()
+    }
+
+    /// Ends the staged send. A detached buffer goes back to its pool.
+    fn finish(&mut self) -> Option<Waker> {
+        if !self.detached {
+            return self.complete();
+        }
+        self.detached = false;
+        self.buf = None;
+        self.err = 0;
+        self.wake_waiters();
+        None
     }
 
     fn wake_waiters(&mut self) {
@@ -310,7 +324,13 @@ impl StreamManager {
     }
 
     pub fn close_stream(&mut self, idx: StreamId) {
+        assert!(!self.is_busy(idx), "closing a stream with a staged send");
         self.slots.close_stream(idx);
+    }
+
+    /// True while the stream holds a staged send.
+    pub(crate) fn is_busy(&self, idx: StreamId) -> bool {
+        self.slots.slot_at(idx).is_some_and(|slot| slot.buf.is_some())
     }
 
     /// True while the stream holds a staged send; `waker` runs once it is released.
@@ -350,6 +370,17 @@ impl StreamManager {
         buf: IoBuf,
         idx: StreamId,
     ) -> Result<(StreamSendFuture, bool), IoBuf> {
+        let queue = self.stage_inner(buf, idx, false)?;
+        Ok((StreamSendFuture::new(idx, self.slots.clone()), queue))
+    }
+
+    /// Stages a send no future waits for. Its buffer is dropped once the send ends.
+    pub(crate) fn stage_detached(&mut self, buf: IoBuf, idx: StreamId) -> Result<bool, IoBuf> {
+        self.stage_inner(buf, idx, true)
+    }
+
+    /// True when the manager went from idle to queued.
+    fn stage_inner(&mut self, buf: IoBuf, idx: StreamId, detached: bool) -> Result<bool, IoBuf> {
         assert!(self.head < STREAM_COUNT, "iovec ring is full");
         assert!(buf.used_bytes() > 0, "staging an empty send");
 
@@ -366,6 +397,7 @@ impl StreamManager {
         slot.waker = None;
         slot.err = 0;
         slot.woken = false;
+        slot.detached = detached;
 
         self.stream_order[self.head] = idx;
         self.iovec[self.head] = iovec_item;
@@ -375,7 +407,7 @@ impl StreamManager {
         if queue {
             self.state = StreamState::Queued;
         }
-        Ok((StreamSendFuture::new(idx, self.slots.clone()), queue))
+        Ok(queue)
     }
 
     pub fn prepare(&mut self) -> *const libc::msghdr {
@@ -405,7 +437,7 @@ impl StreamManager {
                     .expect("failed send on a closed stream");
                 assert_eq!(slot.err, 0, "stream failed twice");
                 slot.err = err;
-                slot.complete()
+                slot.finish()
             };
             if let Some(waker) = waker {
                 waker.wake();
@@ -440,7 +472,7 @@ impl StreamManager {
                 .slots
                 .slot_at_mut(idx)
                 .expect("completed send on a closed stream")
-                .complete();
+                .finish();
             if let Some(waker) = waker {
                 waker.wake();
             }

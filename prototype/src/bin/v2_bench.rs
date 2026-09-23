@@ -214,7 +214,7 @@ struct ThreadState {
     keep_running: Cell<bool>,
     driver: Rc<JournalQuorumDriver>,
     /// Some with `--tcp-datapath`
-    sessions: Option<Rc<SessionManager<ClientSink>>>,
+    sessions: Option<SessionManager<ClientSink>>,
     session_cache: RefCell<HashMap<SocketAddr, SessionId>>,
 }
 
@@ -230,7 +230,7 @@ async fn create_thread_state(
     let sessions = cfg
         .client
         .tcp_datapath
-        .then(|| Rc::new(SessionManager::new(runtime::rt().io().clone(), None::<OwnedFd>, SESSION_SLOTS, driver.tcp_sink())));
+        .then(|| SessionManager::new(runtime::rt().io().clone(), None::<OwnedFd>, SESSION_SLOTS, driver.tcp_sink()));
     Rc::new(ThreadState {
         cfg,
         global,
@@ -432,6 +432,7 @@ impl ThreadState {
         let mut tcp_remotes = ForCluster::new();
         if let Some(sessions) = &self.sessions {
             self.driver.tcp_streams().take_ended(|addr| match state.streams_mut().iter_mut().find(|s| **s == Some(*addr)) {
+                Some(_) if sessions.stream_busy(addr) => false,
                 Some(stream) => {
                     *stream = None;
                     sessions.close_stream(addr);

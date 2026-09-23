@@ -143,6 +143,29 @@ impl Session {
         }
     }
 
+    fn send_detached(
+        &mut self,
+        io: &ThreadUring,
+        slot: SessionId,
+        buf: IoBuf,
+        id: StreamId,
+    ) -> Result<(), (i32, IoBuf)> {
+        if let Some(errno) = self.health.errno() {
+            return Err((errno, buf));
+        }
+        if self.manager.is_busy(id) {
+            return Err((libc::EBUSY, buf));
+        }
+        let submit = self
+            .manager
+            .stage_detached(buf, id)
+            .map_err(|buf| (libc::EBADF, buf))?;
+        if submit {
+            self.submit(io, slot);
+        }
+        Ok(())
+    }
+
     fn submit(&mut self, io: &ThreadUring, slot: SessionId) {
         if let Some(msg) = self.prepare() {
             io.send_stream(&self.fd, slot.slot(), msg);
@@ -345,6 +368,27 @@ impl<C: MessageConsumer> SessionManager<C> {
             Ok(fut) => fut.await,
             Err((errno, buf)) => (io_error(errno), buf),
         }
+    }
+
+    /// Stages `buf` without waiting for it. The buffer is dropped once the send ends.
+    /// A failed send ends the session, which ends its streams.
+    pub fn send(&self, buf: IoBuf, addr: &SessionAddr) -> Result<(), (io::Error, IoBuf)> {
+        self.access(|ctx| {
+            let Some(session) = ctx.socks.index_mut(addr.session.slot()) else {
+                return Err((libc::EBADF, buf));
+            };
+            session.send_detached(&self.io, addr.session, buf, addr.stream)
+        })
+        .map_err(|(errno, buf)| (io::Error::from_raw_os_error(errno), buf))
+    }
+
+    /// True while the stream holds a staged send.
+    pub fn stream_busy(&self, addr: &SessionAddr) -> bool {
+        self.access(|ctx| {
+            ctx.socks
+                .index(addr.session.slot())
+                .is_some_and(|session| session.manager.is_busy(addr.stream))
+        })
     }
 
     fn reap(&self, slt: SessionId, res: io::Result<usize>) {
@@ -565,6 +609,55 @@ mod tests {
         listener.accept().expect("accept failed");
         assert_eq!(mgr.session_health(slt), Some(SessionHealth::Healthy));
         assert_eq!(mgr.peer_addr(slt), Some(peer));
+    }
+
+    fn packet() -> IoBuf {
+        let mut buf = crate::io::local_packet_buffer_pool().pop();
+        buf.mark_used(4);
+        buf
+    }
+
+    #[test]
+    fn test_detached_send_releases_its_buffer() {
+        let (mgr, slt, mut client) = accepted();
+        let addr = mgr.open_stream(slt).expect("stream table full");
+        assert!(mgr.send(packet(), &addr).is_ok());
+        assert!(mgr.stream_busy(&addr), "send staged");
+        let (err, _buf) = mgr.send(packet(), &addr).expect_err("second send on a busy stream");
+        assert_eq!(err.raw_os_error(), Some(libc::EBUSY));
+        drive(&mgr, || !mgr.stream_busy(&addr));
+        read_exact(&mut client, 4);
+        mgr.close_stream(&addr);
+        assert_eq!(mgr.session_health(slt), Some(SessionHealth::Healthy));
+    }
+
+    #[test]
+    fn test_send_error_releases_detached_sends() {
+        let (mgr, slt, _client) = accepted();
+        let first = mgr.open_stream(slt).expect("stream table full");
+        let second = mgr.open_stream(slt).expect("stream table full");
+        let fd = mgr.access(|ctx| ctx.socks.index(slt.slot()).unwrap().raw_fd());
+        assert_eq!(unsafe { libc::shutdown(fd, libc::SHUT_WR) }, 0);
+        assert!(mgr.send(packet(), &first).is_ok());
+        mgr.enter(IOEnterIntent::Poll);
+        assert!(mgr.send(packet(), &second).is_ok(), "queued behind the send in the kernel");
+        drive(&mgr, || ends(&mgr).len() == 2);
+        assert!(!mgr.stream_busy(&first), "failed send in the kernel keeps its buffer");
+        assert!(!mgr.stream_busy(&second), "failed queued send keeps its buffer");
+        let (err, _buf) = mgr.send(packet(), &first).expect_err("send on a failed session");
+        assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
+        mgr.close_stream(&first);
+        mgr.close_stream(&second);
+        assert!(sessions(&mgr).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "closing a stream with a staged send")]
+    fn test_close_of_a_busy_stream_panics() {
+        let (mgr, slt, _client) = accepted();
+        let addr = mgr.open_stream(slt).expect("stream table full");
+        assert!(mgr.send(packet(), &addr).is_ok());
+        mgr.close_stream(&addr);
     }
 
     #[test]
