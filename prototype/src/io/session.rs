@@ -302,7 +302,7 @@ impl<C: MessageConsumer> SessionManager<C> {
         Some(SessionAddr::new(slt, stream))
     }
 
-    pub fn close_stream(&mut self, addr: &SessionAddr) {
+    pub fn close_stream(&self, addr: &SessionAddr) {
         self.access(|ctx| {
             ctx.socks
                 .index_mut(addr.session.slot())
@@ -508,7 +508,7 @@ mod tests {
 
     /// A put on a session the peer ended fails with the session's errno.
     fn put_on_ended_session(reset: bool, errno: i32) {
-        let (mut mgr, slt, client) = accepted();
+        let (mgr, slt, client) = accepted();
         let addr = mgr.open_stream(slt).expect("stream table full");
         if reset {
             socket2::SockRef::from(&client)
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn test_send_error_reaches_every_stream() {
-        let (mut mgr, slt, _client) = accepted();
+        let (mgr, slt, _client) = accepted();
         let idle = mgr.open_stream(slt).expect("stream table full");
         let sending = mgr.open_stream(slt).expect("stream table full");
         let fd = mgr.access(|ctx| ctx.socks.index(slt.slot()).unwrap().raw_fd());
