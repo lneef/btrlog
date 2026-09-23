@@ -541,6 +541,33 @@ mod tests {
     }
 
     #[test]
+    fn test_connect_opens_a_session() {
+        let io = ThreadUring::new_with(|cfg| {
+            cfg.sq_entries = 8;
+            cfg.cq_entries = 8;
+        })
+        .expect("ring creation failed");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listen failed");
+        let peer = listener.local_addr().unwrap();
+        let mgr = SessionManager::new(io, None::<OwnedFd>, 2, Ends::default());
+        let mut cx = std::task::Context::from_waker(Waker::noop());
+        let mut connect = std::pin::pin!(mgr.connect(peer));
+        let mut done = None;
+        for _ in 0..10_000 {
+            if let Poll::Ready(res) = connect.as_mut().poll(&mut cx) {
+                done = Some(res);
+                break;
+            }
+            mgr.enter(IOEnterIntent::Poll);
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        let slt = done.expect("connect never completed").expect("connect failed");
+        listener.accept().expect("accept failed");
+        assert_eq!(mgr.session_health(slt), Some(SessionHealth::Healthy));
+        assert_eq!(mgr.peer_addr(slt), Some(peer));
+    }
+
+    #[test]
     fn test_closed_session_frees_its_slot() {
         let (mgr, slt, client) = accepted();
         drop(client);

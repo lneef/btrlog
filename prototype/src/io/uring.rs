@@ -1947,7 +1947,9 @@ impl ThreadUring {
         socket.set_tcp_keepalive(&keepalive)?;
         socket.set_tcp_user_timeout(Some(Self::USER_TIMEOUT))?;
         socket.set_tcp_nodelay(true)?;
-        socket.set_tcp_congestion(b"bbr")?;
+        if let Err(e) = socket.set_tcp_congestion(b"bbr") {
+            log::debug!("bbr unavailable, keeping the default congestion control: {}", e);
+        }
         let sockaddr = SockAddr::from(addr);
         let fd = socket.as_raw_fd();
         let res = self
