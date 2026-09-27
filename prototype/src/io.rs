@@ -3,6 +3,7 @@ pub mod buffer;
 pub mod client_state;
 pub mod framing;
 pub mod send_buffer;
+pub mod send_ring;
 pub mod session;
 pub mod slot_storage;
 pub mod stream;

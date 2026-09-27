@@ -1,5 +1,5 @@
 use io_uring::types::FsyncFlags;
-use io_uring::{IoUring, cqueue, opcode, squeue, types};
+use io_uring::{IoUring, Submitter, cqueue, opcode, squeue, types};
 #[cfg(feature = "trace-requests")]
 use reqtrace::{CycleMeasurement, FrequencyScale};
 use socket2::{Domain, Protocol, SockAddr, Socket, TcpKeepalive, Type};
@@ -519,6 +519,10 @@ impl UringContext {
         self.config.cq_entries as usize
     }
 
+    pub(super) fn submitter(&self) -> Submitter<'_> {
+        self.ring.submitter()
+    }
+
     fn try_arm_eventfd(&mut self) -> bool {
         if let Some(sqe) = self.doorbell.create_op(Self::EVENTFD_USER_DATA) {
             // enqueue to uring (not using enqueue, b/c it would update statistics about ops)
@@ -979,13 +983,7 @@ impl UringContext {
                 Poll::Pending
             }
         } else {
-            Poll::Ready((
-                (
-                    Err(io::Error::other("Invalid slot index")),
-                    None,
-                ),
-                0,
-            ))
+            Poll::Ready(((Err(io::Error::other("Invalid slot index")), None), 0))
         }
     }
 
@@ -1025,10 +1023,10 @@ enum SessionOp {
         fd: RawFd,
         slot: IndexSlotId,
     },
-    Send {
+    SendBundle {
         fd: RawFd,
         slot: IndexSlotId,
-        msg: *const libc::msghdr,
+        bgid: u16,
     },
 }
 
@@ -1039,8 +1037,8 @@ impl SessionOp {
                 .flags(libc::SOCK_CLOEXEC)
                 .build(),
             Self::Recv { fd, .. } => buf_ring.recv_multi(fd),
-            Self::Send { fd, msg, .. } => opcode::SendMsg::new(types::Fd(fd), msg)
-                .flags(libc::MSG_NOSIGNAL as u32)
+            Self::SendBundle { fd, bgid, .. } => opcode::SendBundle::new(types::Fd(fd), bgid)
+                .flags(libc::MSG_NOSIGNAL | libc::MSG_WAITALL)
                 .build(),
         }
     }
@@ -1050,7 +1048,7 @@ impl SessionOp {
             Self::Accept { .. } => result >= 0,
             // the buffer ring ran dry, the stream is intact
             Self::Recv { .. } => result > 0 || result == -libc::ENOBUFS,
-            Self::Send { .. } => false,
+            Self::SendBundle { .. } => false,
         }
     }
 
@@ -1140,7 +1138,7 @@ impl UringContext {
                     buf_ring.release(BufId(bid));
                 }
             }
-            SessionOp::Send { .. } => {}
+            SessionOp::SendBundle { .. } => {}
         }
     }
 
@@ -1148,7 +1146,7 @@ impl UringContext {
         &mut self,
         on_accept: impl FnMut(io::Result<OwnedFd>),
         on_recv: impl FnMut(IndexSlotId, io::Result<&[u8]>),
-        on_sent: impl FnMut(IndexSlotId, io::Result<usize>),
+        on_sent: impl FnMut(IndexSlotId, io::Result<usize>, Option<u16>),
     ) -> io::Result<usize> {
         let harvested = self.poll_completions()?;
         self.drain_sessions(on_accept, on_recv, on_sent);
@@ -1160,7 +1158,7 @@ impl UringContext {
         &mut self,
         mut on_accept: impl FnMut(io::Result<OwnedFd>),
         mut on_recv: impl FnMut(IndexSlotId, io::Result<&[u8]>),
-        mut on_sent: impl FnMut(IndexSlotId, io::Result<usize>),
+        mut on_sent: impl FnMut(IndexSlotId, io::Result<usize>, Option<u16>),
     ) -> usize {
         let mut drained = 0;
         while let Some(ev) = self.session_done.pop_front() {
@@ -1188,13 +1186,14 @@ impl UringContext {
                         self.buf_ring.release(bid);
                     }
                 }
-                SessionOp::Send { slot, .. } => on_sent(
+                SessionOp::SendBundle { slot, .. } => on_sent(
                     slot,
                     if result >= 0 {
                         Ok(result as usize)
                     } else {
                         Err(io::Error::from_raw_os_error(-result))
                     },
+                    cqueue::buffer_select(flags),
                 ),
             }
         }
@@ -1225,12 +1224,12 @@ impl ThreadUring {
         self.access(|ctx| ctx.cancel_session_op(op_id));
     }
 
-    /// Submits the sendmsg on the next `enter`; the completion arrives via `on_sent`.
-    pub fn send_stream(&self, sock: &impl AsRawFd, slot: IndexSlotId, msg: *const libc::msghdr) -> OpId {
-        let kind = SessionOp::Send {
+    /// Submits a send bundle from buffer group `bgid` on the next `enter`; the completion arrives via `on_sent`.
+    pub fn send_bundle(&self, sock: &impl AsRawFd, slot: IndexSlotId, bgid: u16) -> OpId {
+        let kind = SessionOp::SendBundle {
             fd: sock.as_raw_fd(),
             slot,
-            msg,
+            bgid,
         };
         self.access(|ctx| ctx.submit_session_op(kind))
     }
@@ -1239,7 +1238,7 @@ impl ThreadUring {
         &self,
         on_accept: impl FnMut(io::Result<OwnedFd>),
         on_recv: impl FnMut(IndexSlotId, io::Result<&[u8]>),
-        on_sent: impl FnMut(IndexSlotId, io::Result<usize>),
+        on_sent: impl FnMut(IndexSlotId, io::Result<usize>, Option<u16>),
     ) -> io::Result<usize> {
         self.access(|ctx| ctx.poll_completion(on_accept, on_recv, on_sent))
     }
@@ -1248,7 +1247,7 @@ impl ThreadUring {
         &self,
         on_accept: impl FnMut(io::Result<OwnedFd>),
         on_recv: impl FnMut(IndexSlotId, io::Result<&[u8]>),
-        on_sent: impl FnMut(IndexSlotId, io::Result<usize>),
+        on_sent: impl FnMut(IndexSlotId, io::Result<usize>, Option<u16>),
     ) -> usize {
         self.access(|ctx| ctx.drain_sessions(on_accept, on_recv, on_sent))
     }
@@ -1306,6 +1305,10 @@ impl ThreadUring {
     pub(crate) fn iodepth(&self) -> usize {
         self.access(|d| d.iodepth())
     }
+
+    pub(crate) fn submitter(&self) -> Submitter<'_> {
+        unsafe { &*self.inner.get() }.submitter()
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1348,7 +1351,6 @@ pub(crate) enum RequestTracingType {
     Recv,
     RecvMsg,
     Send,
-    SendMsg,
     Sleep,
     StatX,
     Write,
@@ -1816,20 +1818,6 @@ impl ThreadUring {
         })
     }
 
-    pub fn send_msg(
-        &self,
-        sock: impl AsRawFd,
-        msg: *const libc::msghdr,
-        flags: u32,
-    ) -> PendingSimpleOp {
-        let fd = sock.as_raw_fd();
-        self.generic_simple_op(RequestTracingType::SendMsg, |_op_id| {
-            opcode::SendMsg::new(types::Fd(fd), msg)
-                .flags(flags)
-                .build()
-        })
-    }
-
     pub async fn send_to(
         &self,
         sock: impl AsRawFd,
@@ -1952,7 +1940,10 @@ impl ThreadUring {
         socket.set_tcp_user_timeout(Some(Self::USER_TIMEOUT))?;
         socket.set_tcp_nodelay(true)?;
         if let Err(e) = socket.set_tcp_congestion(b"bbr") {
-            log::debug!("bbr unavailable, keeping the default congestion control: {}", e);
+            log::debug!(
+                "bbr unavailable, keeping the default congestion control: {}",
+                e
+            );
         }
         let sockaddr = SockAddr::from(addr);
         let fd = socket.as_raw_fd();
@@ -2113,7 +2104,6 @@ mod multishot_tests {
     use crate::io::slot_storage::IndexableSlotStorage;
     use crate::runtime::*;
     use std::cell::RefCell;
-    use std::ffi::c_void;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::time::Duration;
@@ -2161,7 +2151,7 @@ mod multishot_tests {
                     Err(e) => self.accepted.borrow_mut().err = Some(e),
                 },
                 |_slot, res| self.received.borrow_mut().record(res),
-                |_slot, res| self.sent.borrow_mut().push(res),
+                |_slot, res, _bid| self.sent.borrow_mut().push(res),
             )
             .expect("poll failed");
             let Some(slot) = self.slot.get() else {
@@ -2398,7 +2388,12 @@ mod multishot_tests {
 
     fn assert_cancelled(owner: &Owner) {
         let received = owner.received.borrow();
-        let err = received.end.as_ref().unwrap().as_ref().expect("recv ended cleanly");
+        let err = received
+            .end
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .expect("recv ended cleanly");
         assert_eq!(err.raw_os_error(), Some(libc::ECANCELED));
     }
 
@@ -2419,7 +2414,11 @@ mod multishot_tests {
         drive(&io, &owner, || io.current_outstanding() == 1);
         io.cancel_session_op(op);
         submit(&io);
-        assert_eq!(io.current_outstanding(), 1, "cancel of an ended op submits nothing");
+        assert_eq!(
+            io.current_outstanding(),
+            1,
+            "cancel of an ended op submits nothing"
+        );
     }
 
     #[test]
@@ -2439,7 +2438,7 @@ mod multishot_tests {
     }
 
     #[test]
-    fn test_send_stream() {
+    fn test_send_bundle() {
         let io = small_ring(512);
         let (listener, addr) = listen(&io);
         let owner = Owner::default();
@@ -2447,15 +2446,12 @@ mod multishot_tests {
         submit(&io);
         let (mut client, conn) = accepted_pair(&io, addr, &owner);
         let payload = b"stream bytes";
-        let mut iov = libc::iovec {
-            iov_base: payload.as_ptr() as *mut c_void,
-            iov_len: payload.len(),
-        };
-        // SAFETY: all-zero is a valid msghdr
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        io.send_stream(&conn, slot(), &msg);
+        let mut ring = crate::io::send_ring::SendRing::new(8).unwrap();
+        ring.register(&io.submitter(), 1).unwrap();
+        ring.push(payload.as_ptr(), 6);
+        ring.push(payload[6..].as_ptr(), (payload.len() - 6) as u32);
+        ring.flush();
+        io.send_bundle(&conn, slot(), 1);
         submit(&io);
         assert_eq!(io.current_outstanding(), 2, "accept and send");
         drive(&io, &owner, || !owner.sent.borrow().is_empty());
@@ -2464,6 +2460,7 @@ mod multishot_tests {
         let mut buf = vec![0u8; payload.len()];
         client.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, payload);
+        ring.unregister(&io.submitter()).unwrap();
     }
 
     #[apply(async_test)]
@@ -2560,7 +2557,7 @@ mod multishot_tests {
                 slots.borrow_mut().put(slot);
                 table.closed.push(slot);
             },
-            |_slot, _res| panic!("no sends in this test"),
+            |_slot, _res, _bid| panic!("no sends in this test"),
         )
         .expect("poll failed");
         let mut table = table.borrow_mut();
@@ -2633,14 +2630,17 @@ mod multishot_tests {
         io.drain_sessions(
             |_| panic!("unexpected accept"),
             |_, _| received += 1,
-            |_, _| panic!("unexpected send"),
+            |_, _, _| panic!("unexpected send"),
         );
         received
     }
 
     #[test]
     fn test_drain_publishes_released_buffers_once() {
-        assert_eq!(cqueue::buffer_select(CQE_F_BUFFER | 5 << CQE_BUFFER_SHIFT), Some(5));
+        assert_eq!(
+            cqueue::buffer_select(CQE_F_BUFFER | 5 << CQE_BUFFER_SHIFT),
+            Some(5)
+        );
         let io = small_ring(8);
         let mut sessions = IndexableSlotStorage::<()>::new(1);
         let slot = sessions.get().expect("session slot");
@@ -2650,7 +2650,11 @@ mod multishot_tests {
             push_recv(&io, slot, 4, Some(bid));
         }
         assert_eq!(drain_recvs(&io), 3);
-        assert_eq!(publishes(&io), (before + 1, 11), "one doorbell for three buffers");
+        assert_eq!(
+            publishes(&io),
+            (before + 1, 11),
+            "one doorbell for three buffers"
+        );
     }
 
     #[test]
@@ -2663,6 +2667,10 @@ mod multishot_tests {
         push_recv(&io, slot, 0, None);
         push_recv(&io, slot, -libc::ECONNRESET, None);
         assert_eq!(drain_recvs(&io), 2);
-        assert_eq!(publishes(&io), before, "tail stored without a released buffer");
+        assert_eq!(
+            publishes(&io),
+            before,
+            "tail stored without a released buffer"
+        );
     }
 }

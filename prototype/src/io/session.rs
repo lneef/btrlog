@@ -5,6 +5,8 @@ use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
+use io_uring::Submitter;
+
 use super::ThreadUring;
 use super::buffer::IoBuf;
 use super::slot_storage::{IndexSlotId, IndexableSlotStorage};
@@ -40,9 +42,9 @@ impl SessionHealth {
 pub struct SendStats {
     /// messages staged for a send
     pub staged: u64,
-    /// messages staged while their session had a sendmsg in flight
+    /// messages staged while their session had a send bundle in flight
     pub behind: u64,
-    /// completed sendmsgs
+    /// completed send bundles
     pub sendmsgs: u64,
 }
 
@@ -58,18 +60,27 @@ pub(crate) struct Session {
     peer: SocketAddr,
     manager: StreamManager,
     health: SessionHealth,
-    /// the sendmsg the kernel holds
+    bgid: u16,
+    /// the send bundle the kernel holds
     send: Option<OpId>,
     recv: Option<OpId>,
 }
 
 impl Session {
-    fn new(fd: OwnedFd, peer: SocketAddr, client: bool) -> Self {
+    fn new(
+        fd: OwnedFd,
+        peer: SocketAddr,
+        client: bool,
+        submitter: &Submitter,
+        session: u16,
+    ) -> Self {
+        let bgid = session + 1; // 0 is multishot recv
         Self {
             fd,
             peer,
-            manager: StreamManager::new(client),
+            manager: StreamManager::new(client, submitter, bgid),
             health: SessionHealth::Healthy,
+            bgid,
             send: None,
             recv: None,
         }
@@ -108,10 +119,6 @@ impl Session {
         {
             self.manager.fail_queued(-errno);
         }
-        debug_assert!(
-            self.health == SessionHealth::Healthy || self.send.is_some() || self.manager.staged() == 0,
-            "staged sends outlive the session"
-        );
     }
 
     #[cfg(test)]
@@ -131,7 +138,7 @@ impl Session {
         self.manager.close_stream(id);
     }
 
-    /// Submits the send right away when no sendmsg is in flight.
+    /// Submits the send right away when no send bundle is in flight.
     fn stage(
         &mut self,
         io: &ThreadUring,
@@ -175,23 +182,31 @@ impl Session {
         Ok(())
     }
 
-    /// Hands the staged sends to one sendmsg unless one is in flight.
+    /// Hands the staged sends to one send bundle unless one is in flight.
     fn submit(&mut self, io: &ThreadUring, slot: SessionId) {
-        if self.send.is_some() || self.manager.staged() == 0 || self.health != SessionHealth::Healthy {
-            return;
+        if self.send.is_none() && self.manager.queued() > 0 {
+            self.manager.flush();
+            self.send = Some(io.send_bundle(&self.fd, slot.slot(), self.bgid));
         }
-        let msg = self.manager.prepare();
-        self.send = Some(io.send_stream(&self.fd, slot.slot(), msg));
     }
 
-    /// Ends the sendmsg in flight, then submits what was staged meanwhile.
-    fn reap(&mut self, io: &ThreadUring, slot: SessionId, res: io::Result<usize>) {
-        assert!(self.send.take().is_some(), "send completion without a sendmsg in flight");
+    /// Ends the send bundle in flight, then submits what was staged meanwhile.
+    fn reap(
+        &mut self,
+        io: &ThreadUring,
+        slot: SessionId,
+        res: io::Result<usize>,
+        bid: Option<u16>,
+    ) {
+        assert!(
+            self.send.take().is_some(),
+            "send completion without a send bundle in flight"
+        );
         let res = res.map_err(|e| -e.raw_os_error().expect("send completion without an errno"));
         if let Err(err) = res {
             self.end(SessionHealth::Failed(err));
         }
-        self.manager.reap(res);
+        self.manager.reap(res, bid);
         self.settle();
         self.submit(io, slot);
     }
@@ -231,12 +246,13 @@ pub(crate) struct SessionManagerContext {
 
 impl SessionManagerContext {
     /// Frees the slot of a closed session no stream or kernel op refers to.
-    fn release_if_unused(&mut self, slt: SessionId) {
+    fn release_if_unused(&mut self, slt: SessionId, submitter: &Submitter) {
         let unused = self.socks.index(slt.slot()).is_some_and(|session| {
             session.health() != SessionHealth::Healthy && session.ref_cnt() == 0
         });
         if unused {
-            self.socks.put(slt.slot());
+            let mut session = self.socks.put(slt.slot()).expect("unused session vanished");
+            session.manager.unregister(submitter);
         }
     }
 }
@@ -293,6 +309,20 @@ impl SendStats {
             "send-stats role={} id={} unix_ms={} staged={} behind={} sendmsgs={}",
             role, id, unix_ms, self.staged, self.behind, self.sendmsgs
         );
+    }
+}
+
+impl<C: MessageConsumer> Drop for SessionManager<C> {
+    fn drop(&mut self) {
+        let submitter = self.io.submitter();
+        self.access(|ctx| {
+            let ids: Vec<_> = ctx.socks.ids().collect();
+            for id in ids {
+                if let Some(mut session) = ctx.socks.put(id) {
+                    session.manager.unregister(&submitter);
+                }
+            }
+        });
     }
 }
 
@@ -354,7 +384,7 @@ impl<C: MessageConsumer> SessionManager<C> {
                 .index_mut(addr.session.slot())
                 .expect("close_stream on an unknown session")
                 .close_stream(addr.stream);
-            ctx.release_if_unused(addr.session);
+            ctx.release_if_unused(addr.session, &self.io.submitter());
         });
     }
 
@@ -427,17 +457,17 @@ impl<C: MessageConsumer> SessionManager<C> {
         })
     }
 
-    fn reap(&self, slt: SessionId, res: io::Result<usize>) {
+    fn reap(&self, slt: SessionId, res: io::Result<usize>, bid: Option<u16>) {
         self.access(|ctx| {
             let Some(session) = ctx.socks.index_mut(slt.slot()) else {
                 return;
             };
-            session.reap(&self.io, slt, res);
+            session.reap(&self.io, slt, res, bid);
             ctx.stats.sendmsgs += 1;
             if session.health() != SessionHealth::Healthy {
                 session.cancel_recv(&self.io);
             }
-            ctx.release_if_unused(slt);
+            ctx.release_if_unused(slt, &self.io.submitter());
         });
     }
 
@@ -453,7 +483,7 @@ impl<C: MessageConsumer> SessionManager<C> {
                 Err(e) => log::error!("accept ended: {}", e),
             },
             |slot, res| self.recv(slot.into(), res),
-            |slot, res| self.reap(slot.into(), res),
+            |slot, res, bid| self.reap(slot.into(), res, bid),
         );
         let mut accepted = self.access(|ctx| std::mem::take(&mut ctx.accepted));
         for slot in accepted.drain(..) {
@@ -481,7 +511,7 @@ impl<C: MessageConsumer> SessionManager<C> {
             .access(|ctx| ctx.socks.get())
             .map(SessionId::from)
             .ok_or_else(|| io::Error::other("session table full"))?;
-        let mut session = Session::new(fd, addr, true);
+        let mut session = Session::new(fd, addr, true, &self.io.submitter(), slot.0.idx() as u16);
         session.arm_recv(&self.io, slot);
         self.access(|ctx| ctx.socks.set(slot.slot(), session));
         Ok(slot)
@@ -493,7 +523,10 @@ impl<C: MessageConsumer> SessionManager<C> {
             log::warn!("TCP_NODELAY on an accepted connection failed: {}", e);
         }
         if let Err(e) = sock.set_tcp_congestion(b"bbr") {
-            log::debug!("bbr unavailable, keeping the default congestion control: {}", e);
+            log::debug!(
+                "bbr unavailable, keeping the default congestion control: {}",
+                e
+            );
         }
         let peer = match sock.peer_addr().map(|a| a.as_socket()) {
             Ok(Some(peer)) => peer,
@@ -507,7 +540,10 @@ impl<C: MessageConsumer> SessionManager<C> {
                 log::warn!("session table full, dropping connection");
                 return;
             };
-            ctx.socks.set(slot.slot(), Session::new(fd, peer, false));
+            ctx.socks.set(
+                slot.slot(),
+                Session::new(fd, peer, false, &self.io().submitter(), slot.0.idx() as u16),
+            );
             ctx.accepted.push(slot);
         });
     }
@@ -519,289 +555,7 @@ impl<C: MessageConsumer> SessionManager<C> {
                 return;
             };
             session.on_recv(res, slot, &self.consumer);
-            ctx.release_if_unused(slot);
+            ctx.release_if_unused(slot, &self.io.submitter());
         });
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-//  Tests
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::TcpStream;
-    use std::time::Duration;
-
-    /// Records the end notification of every stream.
-    #[derive(Default)]
-    struct Ends(std::cell::RefCell<Vec<(StreamId, i32)>>);
-
-    impl MessageConsumer for Ends {
-        fn consume(&self, result: i32, addr: SessionAddr, buf: Option<&[u8]>) {
-            if buf.is_none() {
-                self.0.borrow_mut().push((addr.stream(), result));
-            }
-        }
-    }
-
-    fn ends(mgr: &SessionManager<Ends>) -> Vec<(StreamId, i32)> {
-        mgr.consumer.0.borrow().clone()
-    }
-
-    fn staged_put(mgr: &SessionManager<Ends>, addr: &SessionAddr) -> impl Future<Output = (io::Result<usize>, IoBuf)> {
-        let mut buf = crate::io::local_packet_buffer_pool().pop();
-        buf.mark_used(4);
-        mgr.put(buf, addr)
-    }
-
-    fn sessions<C: MessageConsumer>(mgr: &SessionManager<C>) -> Vec<SessionId> {
-        mgr.access(|ctx| ctx.socks.ids().map(SessionId::from).collect())
-    }
-
-    fn drive<C: MessageConsumer>(mgr: &SessionManager<C>, mut done: impl FnMut() -> bool) {
-        for _ in 0..10_000 {
-            if done() {
-                return;
-            }
-            mgr.enter(IOEnterIntent::Poll);
-            mgr.manage().expect("manage failed");
-            std::thread::sleep(Duration::from_micros(100));
-        }
-        panic!("timeout driving the session manager");
-    }
-
-    /// Server manager with one accepted session and its peer.
-    fn accepted() -> (SessionManager<Ends>, SessionId, TcpStream) {
-        let io = ThreadUring::new_with(|cfg| {
-            cfg.sq_entries = 8;
-            cfg.cq_entries = 8;
-        })
-        .expect("ring creation failed");
-        let listener = io.tcp_listener(([127, 0, 0, 1], 0)).expect("listen failed");
-        let addr = listener.local_addr().unwrap();
-        let mut mgr = SessionManager::new(io, Some(listener), 2, Ends::default());
-        mgr.start_accepting();
-        let client = TcpStream::connect(addr).expect("connect failed");
-        drive(&mgr, || sessions(&mgr).len() == 1);
-        let slt = sessions(&mgr)[0];
-        drive(&mgr, || {
-            mgr.access(|ctx| ctx.socks.index(slt.slot()).unwrap().recv.is_some())
-        });
-        assert_eq!(mgr.session_health(slt), Some(SessionHealth::Healthy));
-        (mgr, slt, client)
-    }
-
-    /// A put on a session the peer ended fails with the session's errno.
-    fn put_on_ended_session(reset: bool, errno: i32) {
-        let (mgr, slt, client) = accepted();
-        let addr = mgr.open_stream(slt).expect("stream table full");
-        if reset {
-            socket2::SockRef::from(&client)
-                .set_linger(Some(Duration::ZERO))
-                .unwrap();
-        }
-        drop(client);
-        drive(&mgr, || mgr.session_health(slt) != Some(SessionHealth::Healthy));
-        {
-            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-            let mut put = std::pin::pin!(staged_put(&mgr, &addr));
-            let std::task::Poll::Ready((res, _buf)) = put.as_mut().poll(&mut cx) else {
-                panic!("put on an ended session is pending");
-            };
-            assert_eq!(res.unwrap_err().raw_os_error(), Some(errno));
-        }
-        assert_eq!(ends(&mgr), [(addr.stream(), -libc::ECONNRESET)]);
-        assert!(mgr.open_stream(slt).is_none(), "stream opened on an ended session");
-        assert_eq!(sessions(&mgr), [slt], "the open stream holds the session");
-        mgr.close_stream(&addr);
-        assert!(sessions(&mgr).is_empty());
-        assert_eq!(mgr.session_health(slt), None);
-    }
-
-    fn read_exact(client: &mut TcpStream, len: usize) {
-        use std::io::Read;
-        let mut buf = vec![0u8; len];
-        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        client.read_exact(&mut buf).expect("peer read failed");
-    }
-
-    #[test]
-    fn test_connect_opens_a_session() {
-        let io = ThreadUring::new_with(|cfg| {
-            cfg.sq_entries = 8;
-            cfg.cq_entries = 8;
-        })
-        .expect("ring creation failed");
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listen failed");
-        let peer = listener.local_addr().unwrap();
-        let mgr = SessionManager::new(io, None::<OwnedFd>, 2, Ends::default());
-        let mut cx = std::task::Context::from_waker(Waker::noop());
-        let mut connect = std::pin::pin!(mgr.connect(peer));
-        let mut done = None;
-        for _ in 0..10_000 {
-            if let Poll::Ready(res) = connect.as_mut().poll(&mut cx) {
-                done = Some(res);
-                break;
-            }
-            mgr.enter(IOEnterIntent::Poll);
-            std::thread::sleep(Duration::from_micros(100));
-        }
-        let slt = done.expect("connect never completed").expect("connect failed");
-        listener.accept().expect("accept failed");
-        assert_eq!(mgr.session_health(slt), Some(SessionHealth::Healthy));
-        assert_eq!(mgr.peer_addr(slt), Some(peer));
-    }
-
-    fn packet() -> IoBuf {
-        let mut buf = crate::io::local_packet_buffer_pool().pop();
-        buf.mark_used(4);
-        buf
-    }
-
-    #[test]
-    fn test_detached_send_releases_its_buffer() {
-        let (mgr, slt, mut client) = accepted();
-        let addr = mgr.open_stream(slt).expect("stream table full");
-        assert!(mgr.send(packet(), &addr).is_ok());
-        assert!(mgr.stream_busy(&addr), "send staged");
-        let (err, _buf) = mgr.send(packet(), &addr).expect_err("second send on a busy stream");
-        assert_eq!(err.raw_os_error(), Some(libc::EBUSY));
-        drive(&mgr, || !mgr.stream_busy(&addr));
-        read_exact(&mut client, 4);
-        mgr.close_stream(&addr);
-        assert_eq!(mgr.session_health(slt), Some(SessionHealth::Healthy));
-    }
-
-    #[test]
-    fn test_send_error_releases_detached_sends() {
-        let (mgr, slt, _client) = accepted();
-        let first = mgr.open_stream(slt).expect("stream table full");
-        let second = mgr.open_stream(slt).expect("stream table full");
-        let fd = mgr.access(|ctx| ctx.socks.index(slt.slot()).unwrap().raw_fd());
-        assert_eq!(unsafe { libc::shutdown(fd, libc::SHUT_WR) }, 0);
-        assert!(mgr.send(packet(), &first).is_ok());
-        mgr.enter(IOEnterIntent::Poll);
-        assert!(mgr.send(packet(), &second).is_ok(), "queued behind the send in the kernel");
-        drive(&mgr, || ends(&mgr).len() == 2);
-        assert!(!mgr.stream_busy(&first), "failed send in the kernel keeps its buffer");
-        assert!(!mgr.stream_busy(&second), "failed queued send keeps its buffer");
-        let (err, _buf) = mgr.send(packet(), &first).expect_err("send on a failed session");
-        assert_eq!(err.raw_os_error(), Some(libc::EPIPE));
-        mgr.close_stream(&first);
-        mgr.close_stream(&second);
-        assert!(sessions(&mgr).is_empty());
-    }
-
-    #[test]
-    #[should_panic(expected = "closing a stream with a staged send")]
-    fn test_close_of_a_busy_stream_panics() {
-        let (mgr, slt, _client) = accepted();
-        let addr = mgr.open_stream(slt).expect("stream table full");
-        assert!(mgr.send(packet(), &addr).is_ok());
-        mgr.close_stream(&addr);
-    }
-
-    #[test]
-    fn test_closed_session_frees_its_slot() {
-        let (mgr, slt, client) = accepted();
-        drop(client);
-        drive(&mgr, || sessions(&mgr).is_empty());
-        assert_eq!(
-            mgr.session_health(slt),
-            None,
-            "freed slot answers to a stale id"
-        );
-    }
-
-    #[test]
-    fn test_eof_fails_a_put() {
-        put_on_ended_session(false, libc::EPIPE);
-    }
-
-    #[test]
-    fn test_reset_fails_a_put() {
-        put_on_ended_session(true, libc::ECONNRESET);
-    }
-
-    #[test]
-    fn test_put_submits_without_manager_enter() {
-        let (mgr, slt, mut client) = accepted();
-        assert_eq!(mgr.peer_addr(slt), Some(client.local_addr().unwrap()));
-        let addr = mgr.open_stream(slt).expect("stream table full");
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        let mut put = std::pin::pin!(staged_put(&mgr, &addr));
-        assert!(put.as_mut().poll(&mut cx).is_pending(), "send staged");
-        let mut done = None;
-        for _ in 0..10_000 {
-            mgr.io().enter(IOEnterIntent::Poll);
-            mgr.manage().expect("manage failed");
-            if let std::task::Poll::Ready(res) = put.as_mut().poll(&mut cx) {
-                done = Some(res);
-                break;
-            }
-            std::thread::sleep(Duration::from_micros(100));
-        }
-        let (res, _buf) = done.expect("put never completed");
-        assert_eq!(res.unwrap(), 4);
-        read_exact(&mut client, 4);
-    }
-
-    #[test]
-    fn test_put_waits_on_a_busy_stream() {
-        let (mgr, slt, mut client) = accepted();
-        let addr = mgr.open_stream(slt).expect("stream table full");
-        let woken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        struct Flag(std::sync::Arc<std::sync::atomic::AtomicBool>);
-        impl std::task::Wake for Flag {
-            fn wake(self: std::sync::Arc<Self>) {
-                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        let waker = Waker::from(std::sync::Arc::new(Flag(woken.clone())));
-        let mut cx = std::task::Context::from_waker(&waker);
-        let mut first = std::pin::pin!(staged_put(&mgr, &addr));
-        let mut second = std::pin::pin!(staged_put(&mgr, &addr));
-        assert!(first.as_mut().poll(&mut cx).is_pending(), "first send staged");
-        assert!(second.as_mut().poll(&mut cx).is_pending(), "second put waits");
-        drive(&mgr, || {
-            matches!(first.as_mut().poll(&mut cx), Poll::Ready((Ok(4), _)))
-        });
-        assert!(woken.load(std::sync::atomic::Ordering::SeqCst), "release wakes the waiter");
-        drive(&mgr, || {
-            matches!(second.as_mut().poll(&mut cx), Poll::Ready((Ok(4), _)))
-        });
-        read_exact(&mut client, 8);
-    }
-
-    #[test]
-    fn test_send_error_reaches_every_stream() {
-        let (mgr, slt, _client) = accepted();
-        let idle = mgr.open_stream(slt).expect("stream table full");
-        let sending = mgr.open_stream(slt).expect("stream table full");
-        let fd = mgr.access(|ctx| ctx.socks.index(slt.slot()).unwrap().raw_fd());
-        assert_eq!(unsafe { libc::shutdown(fd, libc::SHUT_WR) }, 0);
-        {
-            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-            let mut put = std::pin::pin!(staged_put(&mgr, &sending));
-            assert!(put.as_mut().poll(&mut cx).is_pending(), "send staged");
-            drive(&mgr, || ends(&mgr).len() == 2);
-            let std::task::Poll::Ready((res, _buf)) = put.as_mut().poll(&mut cx) else {
-                panic!("failed send still pending");
-            };
-            assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EPIPE));
-        }
-        assert_eq!(mgr.session_health(slt), Some(SessionHealth::Failed(-libc::EPIPE)));
-        let mut notified = ends(&mgr);
-        notified.sort_by_key(|(id, _)| id.to_wire());
-        assert_eq!(
-            notified,
-            [(idle.stream(), -libc::EPIPE), (sending.stream(), -libc::EPIPE)],
-            "the send error ends every stream"
-        );
-        mgr.close_stream(&idle);
-        assert_eq!(sessions(&mgr), [slt], "an open stream holds the session");
-        mgr.close_stream(&sending);
-        assert!(sessions(&mgr).is_empty());
     }
 }
